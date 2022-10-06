@@ -20,6 +20,8 @@ void SetSendMessageCallback(OnSendMessageDelegate callback);
 void InitializeMidiLinux();
 void TerminateMidiLinux();
 
+const char* GetDeviceNameLinux(const char* deviceId);
+
 void SendMidiNoteOff(const char* deviceId, char channel, char note, char velocity);
 void SendMidiNoteOn(const char* deviceId, char channel, char note, char velocity);
 void SendMidiPolyphonicAftertouch(const char* deviceId, char channel, char note, char pressure);
@@ -430,6 +432,14 @@ void InitializeMidiLinux() {
 
 void TerminateMidiLinux() {
     isStopped = true;
+}
+
+const char* GetDeviceNameLinux(const char* deviceId) {
+    if (deviceNames.find(deviceId) != deviceNames.end()) {
+        return strdup(deviceNames[deviceId].c_str());
+    }
+
+    return NULL;
 }
 
 void SendMidiNoteOff(const char* deviceId, char channel, char note, char velocity) {
