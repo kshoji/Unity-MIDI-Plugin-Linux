@@ -47,7 +47,11 @@ void SendMidiReset(const char* deviceId);
 
 std::map<std::string, snd_rawmidi_t*> midiInputMap;
 std::map<std::string, snd_rawmidi_t*> midiOutputMap;
+std::map<std::string, snd_seq_addr_t> virtualMidiInputMap;
+std::map<std::string, snd_seq_addr_t> virtualMidiOutputMap;
 std::map<std::string, std::string> deviceNames;
+
+snd_seq_t *seq_handle = nullptr;
 
 const char *GAME_OBJECT_NAME = "MidiManager";
 
@@ -58,6 +62,102 @@ OnSendMessageDelegate onSendMessage;
 void UnitySendMessage(const char* obj, const char* method, const char* msg) {
     if (onSendMessage) {
         onSendMessage(method, msg);
+    }
+}
+
+void virtualMidiEventWatcher() {
+    snd_seq_event_t *ev = nullptr;
+    char deviceId[32];
+    char eventMessage[128];
+
+    while (!isStopped && seq_handle != nullptr) {
+        snd_seq_event_input(seq_handle, &ev);
+
+        sprintf(deviceId, "seq:%d-%d", ev->data.addr.client, ev->data.addr.port);
+        if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
+            // ignore if not connected
+            continue;
+        }
+
+        // https://www.alsa-project.org/alsa-doc/alsa-lib/group___seq_events.html#gaef39e1f267006faf7abc91c3cb32ea40
+        switch (ev->type) {
+            case SND_SEQ_EVENT_NOTEON:
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.note.channel, ev->data.note.note, ev->data.note.velocity);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiNoteOn", eventMessage);
+                break;
+            case SND_SEQ_EVENT_NOTEOFF:
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.note.channel, ev->data.note.note, ev->data.note.velocity);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiNoteOff", eventMessage);
+                break;
+            case SND_SEQ_EVENT_CONTROLLER:
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.control.channel, ev->data.control.param, ev->data.control.value);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiControlChange", eventMessage);
+                break;
+            case SND_SEQ_EVENT_PGMCHANGE:
+                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev->data.control.channel, ev->data.control.value);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiProgramChange", eventMessage);
+                break;
+            case SND_SEQ_EVENT_CHANPRESS:
+                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev->data.control.channel, ev->data.control.value);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiChannelAftertouch", eventMessage);
+                break;
+            case SND_SEQ_EVENT_KEYPRESS:
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.note.channel, ev->data.note.note, ev->data.note.velocity);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiPolyphonicAftertouch", eventMessage);
+                break;
+            case SND_SEQ_EVENT_PITCHBEND:
+                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev->data.control.channel, ev->data.control.value + 8192);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiPitchWheel", eventMessage);
+                break;
+            case SND_SEQ_EVENT_SYSEX:
+                {
+                    std::vector<unsigned char> systemExclusiveStream;
+                    for (int i = 0; i < ev->data.ext.len; ++i) {
+                        systemExclusiveStream.push_back(((unsigned char *)(ev->data.ext.ptr))[i]);
+                    }
+                    std::ostringstream oss;
+                    oss << deviceId;
+                    oss << ",0,";
+                    std::copy(systemExclusiveStream.begin(), systemExclusiveStream.end(), std::ostream_iterator<int>(oss, ","));
+                    systemExclusiveStream.clear();
+
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiSystemExclusive", oss.str().c_str());
+                }
+                break;
+            case SND_SEQ_EVENT_SONGPOS:
+                sprintf(eventMessage, "%s,0,%d", deviceId, ev->data.control.value);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiSongPositionPointer", eventMessage);
+                break;
+            case SND_SEQ_EVENT_SONGSEL:
+                sprintf(eventMessage, "%s,0,%d", deviceId, ev->data.control.value);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiSongSelect", eventMessage);
+                break;
+            case SND_SEQ_EVENT_QFRAME:
+                sprintf(eventMessage, "%s,0,%d", deviceId, ev->data.control.value);
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiTimeCodeQuarterFrame", eventMessage);
+                break;
+            case SND_SEQ_EVENT_TUNE_REQUEST:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiTuneRequest", deviceId);
+                break;
+            case SND_SEQ_EVENT_CLOCK:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiTimingClock", deviceId);
+                break;
+            case SND_SEQ_EVENT_START:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiStart", deviceId);
+                break;
+            case SND_SEQ_EVENT_CONTINUE:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiContinue", deviceId);
+                break;
+            case SND_SEQ_EVENT_STOP:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiStop", deviceId);
+                break;
+            case SND_SEQ_EVENT_SENSING:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiActiveSensing", deviceId);
+                break;
+            case SND_SEQ_EVENT_RESET:
+                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiReset", deviceId);
+                break;
+        }
     }
 }
 
@@ -318,8 +418,37 @@ void midiEventWatcher(std::string deviceIdStr, snd_rawmidi_t* midiInput) {
     }
 }
 
+#define ENABLE_RAWMIDI
+#define LIST_INPUT	1
+#define LIST_OUTPUT	2
+#define perm_ok(cap,bits) (((cap) & (bits)) == (bits))
+static int check_permission(snd_seq_port_info_t *pinfo, int perm)
+{
+	int cap = snd_seq_port_info_get_capability(pinfo);
+
+	if (cap & SND_SEQ_PORT_CAP_NO_EXPORT)
+		return 0;
+
+	if (!perm)
+		return 1;
+	if (perm & LIST_INPUT) {
+		if (perm_ok(cap, SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ))
+			return 1;
+	}
+	if (perm & LIST_OUTPUT) {
+		if (perm_ok(cap, SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE))
+			return 1;
+	}
+	return 0;
+}
+
 void midiConnectionWatcher() {
     using namespace std::chrono_literals;
+
+    char deviceId[32];
+
+#ifdef ENABLE_RAWMIDI
+    // rawmidi
     int status;
     int card;
 
@@ -327,7 +456,6 @@ void midiConnectionWatcher() {
     char name[32];
     int device;
     char sub_name[32];
-    char deviceId[32];
 
     char* deviceName = NULL;
 
@@ -336,85 +464,134 @@ void midiConnectionWatcher() {
     int sub;
 
     snd_rawmidi_info_alloca(&info);
+#endif
+
+    // virtual midi
+    int client;
+    int port;
+
+    snd_seq_client_info_t *cinfo;
+    snd_seq_port_info_t *pinfo;
+
+	snd_seq_client_info_alloca(&cinfo);
+	snd_seq_port_info_alloca(&pinfo);
+	snd_seq_client_info_set_client(cinfo, -1);
 
     while (!isStopped) {
-        card = -1;
-        if ((status = snd_card_next(&card)) < 0) {
-            continue;
-        }
-        if (card < 0) {
-            continue;
+        while (snd_seq_query_next_client(seq_handle, cinfo) >= 0) {
+            // loop with client
+            // reset query info
+            snd_seq_port_info_set_client(pinfo, snd_seq_client_info_get_client(cinfo));
+            snd_seq_port_info_set_port(pinfo, -1);
+
+            while (snd_seq_query_next_port(seq_handle, pinfo) >= 0) {
+                // loop with port
+                if (check_permission(pinfo, LIST_INPUT)) {
+                    // found a input port
+                    snd_seq_addr_t addr;
+                    addr.client = snd_seq_client_info_get_client(cinfo);
+                    addr.port = snd_seq_port_info_get_port(pinfo);
+                    sprintf(deviceId, "seq:%d-%d", addr.client, addr.port);
+
+                    const char* deviceName = snd_seq_client_info_get_name(cinfo);
+                    if (deviceNames.find(deviceId) == deviceNames.end()) {
+                        deviceNames.insert(std::make_pair(deviceId, deviceName));
+                    }
+                    virtualMidiInputMap.insert(std::make_pair(deviceId, addr));
+
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceAttached", deviceId);
+                }
+                if (check_permission(pinfo, LIST_OUTPUT)) {
+                    // found a output port
+                    snd_seq_addr_t addr;
+                    addr.client = snd_seq_client_info_get_client(cinfo);
+                    addr.port = snd_seq_port_info_get_port(pinfo);
+                    sprintf(deviceId, "seq:%d-%d", addr.client, addr.port);
+
+                    const char* deviceName = snd_seq_client_info_get_name(cinfo);
+                    if (deviceNames.find(deviceId) == deviceNames.end()) {
+                        deviceNames.insert(std::make_pair(deviceId, deviceName));
+                    }
+                    virtualMidiOutputMap.insert(std::make_pair(deviceId, addr));
+
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceAttached", deviceId);
+                }
+            }
         }
 
-        while (card >= 0) {
-            sprintf(name, "hw:%d", card);
-            if ((status = snd_ctl_open(&ctl, name, 0)) < 0) {
-                continue;
-            }
-            snd_card_get_name(card, &deviceName);
-            device = -1;
-            do {
-                status = snd_ctl_rawmidi_next_device(ctl, &device);
-                if (status < 0) {
+#ifdef ENABLE_RAWMIDI
+        if ((status = snd_card_next(&card)) >= 0 && (card >= 0)) {
+            while (card >= 0) {
+                sprintf(name, "hw:%d", card);
+                if ((status = snd_ctl_open(&ctl, name, 0)) < 0) {
+                    continue;
+                }
+                snd_card_get_name(card, &deviceName);
+                device = -1;
+                do {
+                    status = snd_ctl_rawmidi_next_device(ctl, &device);
+                    if (status < 0) {
+                        break;
+                    }
+                    if (device >= 0) {
+                        snd_rawmidi_info_set_device(info, device);
+
+                        // sub devices: input
+                        snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
+                        snd_ctl_rawmidi_info(ctl, info);
+                        subs = snd_rawmidi_info_get_subdevices_count(info);
+                        for (sub = 0; sub < subs; sub++) {
+                            sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
+                            sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
+                            if (midiInputMap.find(deviceId) == midiInputMap.end()) {
+                                snd_rawmidi_t* midiInput = NULL;
+                                snd_rawmidi_open(&midiInput, NULL, sub_name, SND_RAWMIDI_SYNC);
+                                if (midiInput) {
+                                    if (deviceNames.find(deviceId) == deviceNames.end()) {
+                                        deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    }
+                                    midiInputMap.insert(std::make_pair(deviceId, midiInput));
+
+                                    // input watcher thread
+                                    std::string deviceIdStr = deviceId;
+                                    std::thread midiInputThread(midiEventWatcher, deviceIdStr, midiInput);
+                                    midiInputThread.detach();
+
+                                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceAttached", deviceId);
+                                }
+                            }
+                        }
+
+                        // sub devices: output
+                        snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
+                        snd_ctl_rawmidi_info(ctl, info);
+                        subs = snd_rawmidi_info_get_subdevices_count(info);
+                        for (sub = 0; sub < subs; sub++) {
+                            sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
+                            sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
+                            if (midiOutputMap.find(deviceId) == midiOutputMap.end()) {
+                                snd_rawmidi_t* midiOutput = NULL;
+                                snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_SYNC);
+                                if (midiOutput) {
+                                    if (deviceNames.find(deviceId) == deviceNames.end()) {
+                                        deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    }
+                                    midiOutputMap.insert(std::make_pair(deviceId, midiOutput));
+
+                                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceAttached", deviceId);
+                                }
+                            }
+                        }
+                    }
+                } while (device >= 0);
+                snd_ctl_close(ctl);
+
+                if ((status = snd_card_next(&card)) < 0) {
                     break;
                 }
-                if (device >= 0) {
-                    snd_rawmidi_info_set_device(info, device);
-
-                    // sub devices: input
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
-                    snd_ctl_rawmidi_info(ctl, info);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
-                    for (sub = 0; sub < subs; sub++) {
-                        sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
-                        sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
-                        if (midiInputMap.find(deviceId) == midiInputMap.end()) {
-                            snd_rawmidi_t* midiInput = NULL;
-                            snd_rawmidi_open(&midiInput, NULL, sub_name, SND_RAWMIDI_SYNC);
-                            if (midiInput) {
-                                if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
-                                }
-                                midiInputMap.insert(std::make_pair(deviceId, midiInput));
-
-                                // input watcher thread
-                                std::string deviceIdStr = deviceId;
-                                std::thread midiInputThread(midiEventWatcher, deviceIdStr, midiInput);
-                                midiInputThread.detach();
-
-                                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceAttached", deviceId);
-                            }
-                        }
-                    }
-
-                    // sub devices: output
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
-                    snd_ctl_rawmidi_info(ctl, info);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
-                    for (sub = 0; sub < subs; sub++) {
-                        sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
-                        sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
-                        if (midiOutputMap.find(deviceId) == midiOutputMap.end()) {
-                            snd_rawmidi_t* midiOutput = NULL;
-                            snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_SYNC);
-                            if (midiOutput) {
-                                if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
-                                }
-                                midiOutputMap.insert(std::make_pair(deviceId, midiOutput));
-
-                                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceAttached", deviceId);
-                            }
-                        }
-                    }
-                }
-            } while (device >= 0);
-            snd_ctl_close(ctl);
-
-            if ((status = snd_card_next(&card)) < 0) {
-                break;
             }
-        } 
+        }
+#endif
 
         std::this_thread::sleep_for(100ms);
     }
@@ -425,9 +602,21 @@ void SetSendMessageCallback(OnSendMessageDelegate callback) {
 }
 
 void InitializeMidiLinux() {
+    if (seq_handle == nullptr) {
+        snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0);
+        snd_seq_set_client_name(seq_handle, "Midi Handler");
+        snd_seq_create_simple_port(seq_handle, "inout",
+            SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ|SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE,
+            SND_SEQ_PORT_TYPE_APPLICATION);
+    }
+
     isStopped = false;
     std::thread midiConnectionThread(midiConnectionWatcher);
     midiConnectionThread.detach();
+
+    // input watcher thread
+    std::thread midiInputThread(virtualMidiEventWatcher);
+    midiInputThread.detach();
 }
 
 void TerminateMidiLinux() {
@@ -452,6 +641,18 @@ void SendMidiNoteOff(const char* deviceId, char channel, char note, char velocit
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
     }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_noteoff(&ev, channel, note, velocity);
+        snd_seq_event_output(seq_handle, &ev);
+    }
 }
 
 void SendMidiNoteOn(const char* deviceId, char channel, char note, char velocity) {
@@ -463,6 +664,19 @@ void SendMidiNoteOn(const char* deviceId, char channel, char note, char velocity
             midiOutputMap.erase(deviceId);
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
+    }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_noteon(&ev, channel, note, velocity);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
     }
 }
 
@@ -476,6 +690,19 @@ void SendMidiPolyphonicAftertouch(const char* deviceId, char channel, char note,
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
     }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_keypress(&ev, channel, note, pressure);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
+    }
 }
 
 void SendMidiControlChange(const char* deviceId, char channel, char func, char value) {
@@ -487,6 +714,19 @@ void SendMidiControlChange(const char* deviceId, char channel, char func, char v
             midiOutputMap.erase(deviceId);
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
+    }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_controller(&ev, channel, func, value);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
     }
 }
 
@@ -500,6 +740,19 @@ void SendMidiProgramChange(const char* deviceId, char channel, char program) {
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
     }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_pgmchange(&ev, channel, program);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
+    }
 }
 
 void SendMidiChannelAftertouch(const char* deviceId, char channel, char pressure) {
@@ -511,6 +764,19 @@ void SendMidiChannelAftertouch(const char* deviceId, char channel, char pressure
             midiOutputMap.erase(deviceId);
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
+    }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_chanpress(&ev, channel, pressure);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
     }
 }
 
@@ -524,6 +790,19 @@ void SendMidiPitchWheel(const char* deviceId, char channel, short amount) {
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
     }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_pitchbend(&ev, channel, amount - 8192);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
+    }
 }
 
 void SendMidiSystemExclusive(const char* deviceId, unsigned char* data, int length) {
@@ -534,6 +813,19 @@ void SendMidiSystemExclusive(const char* deviceId, unsigned char* data, int leng
             midiOutputMap.erase(deviceId);
             UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", deviceId);
         }
+    }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_sysex(&ev, length, data);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
     }
 }
 
