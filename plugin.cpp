@@ -52,6 +52,8 @@ std::map<std::string, snd_seq_addr_t> virtualMidiOutputMap;
 std::map<std::string, std::string> deviceNames;
 
 snd_seq_t *seq_handle = nullptr;
+int selfClientId;
+int selfPortNumber;
 
 const char *GAME_OBJECT_NAME = "MidiManager";
 
@@ -481,43 +483,56 @@ void midiConnectionWatcher() {
         snd_seq_client_info_set_client(cinfo, -1);
         while (snd_seq_query_next_client(seq_handle, cinfo) >= 0) {
             // loop with client
+            if (snd_seq_client_info_get_type(cinfo) == SND_SEQ_KERNEL_CLIENT) {
+                // system client: ignore
+                continue;
+            }
+
             // reset query info
             snd_seq_port_info_set_client(pinfo, snd_seq_client_info_get_client(cinfo));
             snd_seq_port_info_set_port(pinfo, -1);
 
             while (snd_seq_query_next_port(seq_handle, pinfo) >= 0) {
                 // loop with port
+                snd_seq_addr_t addr;
+                addr.client = snd_seq_client_info_get_client(cinfo);
+                addr.port = snd_seq_port_info_get_port(pinfo);
+
+                if (addr.client == selfClientId && addr.port == selfPortNumber) {
+                    // self client: ignore
+                    continue;
+                }
+
                 if (check_permission(pinfo, LIST_INPUT)) {
                     // found a input port
-                    snd_seq_addr_t addr;
-                    addr.client = snd_seq_client_info_get_client(cinfo);
-                    addr.port = snd_seq_port_info_get_port(pinfo);
                     sprintf(deviceId, "seq:%d-%d", addr.client, addr.port);
-
-                    const char* deviceName = snd_seq_client_info_get_name(cinfo);
-                    if (deviceNames.find(deviceId) == deviceNames.end()) {
-                        deviceNames.insert(std::make_pair(deviceId, deviceName));
-                    }
-                    virtualMidiInputMap.insert(std::make_pair(deviceId, addr));
                     currentConnections.insert(deviceId);
 
-                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceAttached", deviceId);
+                    if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
+                        const char* deviceName = snd_seq_client_info_get_name(cinfo);
+                        if (deviceNames.find(deviceId) == deviceNames.end()) {
+                            deviceNames.insert(std::make_pair(deviceId, deviceName));
+                        }
+                        virtualMidiInputMap.insert(std::make_pair(deviceId, addr));
+
+                        UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceAttached", deviceId);
+                    }
                 }
+
                 if (check_permission(pinfo, LIST_OUTPUT)) {
                     // found a output port
-                    snd_seq_addr_t addr;
-                    addr.client = snd_seq_client_info_get_client(cinfo);
-                    addr.port = snd_seq_port_info_get_port(pinfo);
                     sprintf(deviceId, "seq:%d-%d", addr.client, addr.port);
-
-                    const char* deviceName = snd_seq_client_info_get_name(cinfo);
-                    if (deviceNames.find(deviceId) == deviceNames.end()) {
-                        deviceNames.insert(std::make_pair(deviceId, deviceName));
-                    }
-                    virtualMidiOutputMap.insert(std::make_pair(deviceId, addr));
                     currentConnections.insert(deviceId);
 
-                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceAttached", deviceId);
+                    if (virtualMidiOutputMap.find(deviceId) == virtualMidiOutputMap.end()) {
+                        const char* deviceName = snd_seq_client_info_get_name(cinfo);
+                        if (deviceNames.find(deviceId) == deviceNames.end()) {
+                            deviceNames.insert(std::make_pair(deviceId, deviceName));
+                        }
+                        virtualMidiOutputMap.insert(std::make_pair(deviceId, addr));
+
+                        UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceAttached", deviceId);
+                    }
                 }
             }
         }
@@ -569,6 +584,8 @@ void midiConnectionWatcher() {
                         for (sub = 0; sub < subs; sub++) {
                             sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                             sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
+                            currentConnections.insert(deviceId);
+
                             if (midiInputMap.find(deviceId) == midiInputMap.end()) {
                                 snd_rawmidi_t* midiInput = NULL;
                                 snd_rawmidi_open(&midiInput, NULL, sub_name, SND_RAWMIDI_SYNC);
@@ -577,7 +594,6 @@ void midiConnectionWatcher() {
                                         deviceNames.insert(std::make_pair(deviceId, deviceName));
                                     }
                                     midiInputMap.insert(std::make_pair(deviceId, midiInput));
-                                    currentConnections.insert(deviceId);
 
                                     // input watcher thread
                                     std::string deviceIdStr = deviceId;
@@ -596,6 +612,8 @@ void midiConnectionWatcher() {
                         for (sub = 0; sub < subs; sub++) {
                             sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                             sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
+                            currentConnections.insert(deviceId);
+
                             if (midiOutputMap.find(deviceId) == midiOutputMap.end()) {
                                 snd_rawmidi_t* midiOutput = NULL;
                                 snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_SYNC);
@@ -604,7 +622,6 @@ void midiConnectionWatcher() {
                                         deviceNames.insert(std::make_pair(deviceId, deviceName));
                                     }
                                     midiOutputMap.insert(std::make_pair(deviceId, midiOutput));
-                                    currentConnections.insert(deviceId);
 
                                     UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceAttached", deviceId);
                                 }
@@ -654,7 +671,8 @@ void InitializeMidiLinux() {
     if (seq_handle == nullptr) {
         snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0);
         snd_seq_set_client_name(seq_handle, "Midi Handler");
-        snd_seq_create_simple_port(seq_handle, "inout",
+        selfClientId = snd_seq_client_id(seq_handle);
+        selfPortNumber = snd_seq_create_simple_port(seq_handle, "inout",
             SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ|SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE,
             SND_SEQ_PORT_TYPE_APPLICATION);
     }
