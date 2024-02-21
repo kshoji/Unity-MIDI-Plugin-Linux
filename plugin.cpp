@@ -415,12 +415,10 @@ void midiEventWatcher(std::string deviceIdStr, snd_rawmidi_t* midiInput) {
     }
 }
 
-#define ENABLE_RAWMIDI
 #define LIST_INPUT    1
 #define LIST_OUTPUT    2
 #define perm_ok(cap,bits) (((cap) & (bits)) == (bits))
-static int check_permission(snd_seq_port_info_t *pinfo, int perm)
-{
+static int check_permission(snd_seq_port_info_t *pinfo, int perm) {
     int cap = snd_seq_port_info_get_capability(pinfo);
 
     if (cap & SND_SEQ_PORT_CAP_NO_EXPORT) {
@@ -432,6 +430,7 @@ static int check_permission(snd_seq_port_info_t *pinfo, int perm)
             return 1;
         }
     }
+
     if (perm & LIST_OUTPUT) {
         if (perm_ok(cap, SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE)) {
             return 1;
@@ -445,7 +444,16 @@ void midiConnectionWatcher() {
 
     char deviceId[32];
 
-#ifdef ENABLE_RAWMIDI
+    // virtual midi
+    int client;
+    int port;
+
+    snd_seq_client_info_t *cinfo;
+    snd_seq_port_info_t *pinfo;
+
+    snd_seq_client_info_alloca(&cinfo);
+    snd_seq_port_info_alloca(&pinfo);
+
     // rawmidi
     int status;
     int card;
@@ -462,22 +470,12 @@ void midiConnectionWatcher() {
     int sub;
 
     snd_rawmidi_info_alloca(&info);
-#endif
-
-    // virtual midi
-    int client;
-    int port;
-
-    snd_seq_client_info_t *cinfo;
-    snd_seq_port_info_t *pinfo;
-
-    snd_seq_client_info_alloca(&cinfo);
-    snd_seq_port_info_alloca(&pinfo);
 
     // current connections to detect detached
     std::set<std::string> currentConnections;
     std::set<std::string> connectionsToRemove;
 
+    // virtual midi
     while (!isStopped) {
         currentConnections.clear();
         snd_seq_client_info_set_client(cinfo, -1);
@@ -558,7 +556,7 @@ void midiConnectionWatcher() {
             virtualMidiOutputMap.erase(*it);
         }
 
-#ifdef ENABLE_RAWMIDI
+        // rawmidi
         currentConnections.clear();
         card = -1;
         if ((status = snd_card_next(&card)) >= 0 && (card >= 0)) {
@@ -657,10 +655,9 @@ void midiConnectionWatcher() {
         for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
             midiOutputMap.erase(*it);
         }
-#endif
 
         std::this_thread::sleep_for(100ms);
-        }
+    }
 }
 
 void SetSendMessageCallback(OnSendMessageDelegate callback) {
