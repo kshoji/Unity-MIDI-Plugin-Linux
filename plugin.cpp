@@ -911,6 +911,19 @@ void SendMidiStart(const char* deviceId) {
         char midi[1] = {(char)0xfa};
         snd_rawmidi_write(it->second, midi, 1);
     }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_queue_start(&ev, SND_SEQ_QUEUE_DIRECT);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
+    }
 }
 
 void SendMidiContinue(const char* deviceId) {
@@ -919,6 +932,19 @@ void SendMidiContinue(const char* deviceId) {
         char midi[1] = {(char)0xfb};
         snd_rawmidi_write(it->second, midi, 1);
     }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_queue_continue(&ev, SND_SEQ_QUEUE_DIRECT);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
+    }
 }
 
 void SendMidiStop(const char* deviceId) {
@@ -926,6 +952,19 @@ void SendMidiStop(const char* deviceId) {
     if (it != midiOutputMap.end()) {
         char midi[1] = {(char)0xfc};
         snd_rawmidi_write(it->second, midi, 1);
+    }
+
+    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        snd_seq_event_t ev;
+        snd_seq_ev_clear(&ev);
+        snd_seq_ev_set_direct(&ev);
+
+        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+
+        snd_seq_ev_set_queue_stop(&ev, SND_SEQ_QUEUE_DIRECT);
+        snd_seq_event_output(seq_handle, &ev);
+        snd_seq_drain_output(seq_handle);
     }
 }
 
