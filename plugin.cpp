@@ -2,6 +2,7 @@
 #include <chrono>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -51,6 +52,12 @@ std::map<std::string, snd_seq_addr_t> virtualMidiInputMap;
 std::map<std::string, snd_seq_addr_t> virtualMidiOutputMap;
 std::map<std::string, std::string> deviceNames;
 
+std::mutex midiInputMapMutex;
+std::mutex midiOutputMapMutex;
+std::mutex virtualMidiInputMapMutex;
+std::mutex virtualMidiOutputMapMutex;
+std::mutex deviceNamesMutex;
+
 snd_seq_t *seq_handle = nullptr;
 int selfClientId;
 int selfPortNumber;
@@ -76,9 +83,12 @@ void virtualMidiEventWatcher() {
         snd_seq_event_input(seq_handle, &ev);
 
         sprintf(deviceId, "seq:%d-%d", ev->data.addr.client, ev->data.addr.port);
-        if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
-            // ignore if not connected
-            continue;
+        {
+            std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
+            if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
+                // ignore if not connected
+                continue;
+            }
         }
 
         // https://www.alsa-project.org/alsa-doc/alsa-lib/group___seq_events.html#gaef39e1f267006faf7abc91c3cb32ea40
@@ -506,6 +516,7 @@ void midiConnectionWatcher() {
                     sprintf(deviceId, "seq:%d-%d", addr.client, addr.port);
                     currentConnections.insert(deviceId);
 
+                    std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
                     if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
                         const char* deviceName = snd_seq_client_info_get_name(cinfo);
                         if (deviceNames.find(deviceId) == deviceNames.end()) {
@@ -522,6 +533,7 @@ void midiConnectionWatcher() {
                     sprintf(deviceId, "seq:%d-%d", addr.client, addr.port);
                     currentConnections.insert(deviceId);
 
+                    std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
                     if (virtualMidiOutputMap.find(deviceId) == virtualMidiOutputMap.end()) {
                         const char* deviceName = snd_seq_client_info_get_name(cinfo);
                         if (deviceNames.find(deviceId) == deviceNames.end()) {
@@ -536,24 +548,31 @@ void midiConnectionWatcher() {
         }
 
         connectionsToRemove.clear();
-        for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiInputMap.begin(); it != virtualMidiInputMap.end(); ++it) {
-            if (currentConnections.find(it->first) == currentConnections.end()) {
-                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceDetached", it->first.c_str());
-                connectionsToRemove.insert(it->first);
+        {
+            std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
+
+            for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiInputMap.begin(); it != virtualMidiInputMap.end(); ++it) {
+                if (currentConnections.find(it->first) == currentConnections.end()) {
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceDetached", it->first.c_str());
+                    connectionsToRemove.insert(it->first);
+                }
             }
-        }
-        for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-            virtualMidiInputMap.erase(*it);
+            for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
+                virtualMidiInputMap.erase(*it);
+            }
         }
         connectionsToRemove.clear();
-        for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiOutputMap.begin(); it != virtualMidiOutputMap.end(); ++it) {
-            if (currentConnections.find(it->first) == currentConnections.end()) {
-                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", it->first.c_str());
-                connectionsToRemove.insert(it->first);
+        {
+            std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+            for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiOutputMap.begin(); it != virtualMidiOutputMap.end(); ++it) {
+                if (currentConnections.find(it->first) == currentConnections.end()) {
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", it->first.c_str());
+                    connectionsToRemove.insert(it->first);
+                }
             }
-        }
-        for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-            virtualMidiOutputMap.erase(*it);
+            for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
+                virtualMidiOutputMap.erase(*it);
+            }
         }
 
         // rawmidi
@@ -584,6 +603,7 @@ void midiConnectionWatcher() {
                             sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
                             currentConnections.insert(deviceId);
 
+                            std::lock_guard<std::mutex> lock(midiInputMapMutex);
                             if (midiInputMap.find(deviceId) == midiInputMap.end()) {
                                 snd_rawmidi_t* midiInput = NULL;
                                 snd_rawmidi_open(&midiInput, NULL, sub_name, SND_RAWMIDI_SYNC);
@@ -612,6 +632,7 @@ void midiConnectionWatcher() {
                             sprintf(deviceId, "hw:%d-%d-%d", card, device, sub);
                             currentConnections.insert(deviceId);
 
+                            std::lock_guard<std::mutex> lock(midiOutputMapMutex);
                             if (midiOutputMap.find(deviceId) == midiOutputMap.end()) {
                                 snd_rawmidi_t* midiOutput = NULL;
                                 snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_SYNC);
@@ -636,44 +657,55 @@ void midiConnectionWatcher() {
         }
 
         connectionsToRemove.clear();
-        for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.begin(); it != midiInputMap.end(); ++it) {
-            if (currentConnections.find(it->first) == currentConnections.end()) {
-                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceDetached", it->first.c_str());
-                connectionsToRemove.insert(it->first);
+        {
+            std::lock_guard<std::mutex> lock(midiInputMapMutex);
+            for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.begin(); it != midiInputMap.end(); ++it) {
+                if (currentConnections.find(it->first) == currentConnections.end()) {
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceDetached", it->first.c_str());
+                    connectionsToRemove.insert(it->first);
+                }
             }
-        }
-        for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-            midiInputMap.erase(*it);
+            for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
+                midiInputMap.erase(*it);
+            }
         }
         connectionsToRemove.clear();
-        for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiOutputMap.begin(); it != midiOutputMap.end(); ++it) {
-            if (currentConnections.find(it->first) == currentConnections.end()) {
-                UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", it->first.c_str());
-                connectionsToRemove.insert(it->first);
+        {
+            std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+            for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiOutputMap.begin(); it != midiOutputMap.end(); ++it) {
+                if (currentConnections.find(it->first) == currentConnections.end()) {
+                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", it->first.c_str());
+                    connectionsToRemove.insert(it->first);
+                }
             }
-        }
-        for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-            midiOutputMap.erase(*it);
+            for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
+                midiOutputMap.erase(*it);
+            }
         }
 
         std::this_thread::sleep_for(100ms);
     }
 
     // terminated, cleanup
-    for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiInputMap.begin(); it != virtualMidiInputMap.end(); ++it) {
-        virtualMidiInputMap.erase(it->first);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
+        virtualMidiInputMap.clear();
     }
-    for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiOutputMap.begin(); it != virtualMidiOutputMap.end(); ++it) {
-        virtualMidiOutputMap.erase(it->first);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        virtualMidiOutputMap.clear();
     }
-    for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.begin(); it != midiInputMap.end(); ++it) {
-        midiInputMap.erase(it->first);
+    {
+        std::lock_guard<std::mutex> lock(midiInputMapMutex);
+        midiInputMap.clear();
     }
-    for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiOutputMap.begin(); it != midiOutputMap.end(); ++it) {
-        midiOutputMap.erase(it->first);
+    {
+        std::lock_guard<std::mutex> lock(midiInputMapMutex);
+        midiOutputMap.clear();
     }
-    for (std::map<std::string, std::string>::iterator it = deviceNames.begin(); it != deviceNames.end(); ++it) {
-        deviceNames.erase(it->first);
+    {
+        std::lock_guard<std::mutex> lock(deviceNamesMutex);
+        deviceNames.clear();
     }
 }
 
@@ -713,173 +745,222 @@ const char* GetDeviceNameLinux(const char* deviceId) {
 }
 
 void SendMidiNoteOff(const char* deviceId, char channel, char note, char velocity) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[3] = {(char)(0x80 | channel), note, velocity};
-        snd_rawmidi_write(it->second, midi, 3);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[3] = {(char)(0x80 | channel), note, velocity};
+            snd_rawmidi_write(it->second, midi, 3);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_noteoff(&ev, channel, note, velocity);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_noteoff(&ev, channel, note, velocity);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiNoteOn(const char* deviceId, char channel, char note, char velocity) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[3] = {(char)(0x90 | channel), note, velocity};
-        snd_rawmidi_write(it->second, midi, 3);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[3] = {(char)(0x90 | channel), note, velocity};
+            snd_rawmidi_write(it->second, midi, 3);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_noteon(&ev, channel, note, velocity);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_noteon(&ev, channel, note, velocity);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiPolyphonicAftertouch(const char* deviceId, char channel, char note, char pressure) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[3] = {(char)(0xa0 | channel), note, pressure};
-        snd_rawmidi_write(it->second, midi, 3);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[3] = {(char)(0xa0 | channel), note, pressure};
+            snd_rawmidi_write(it->second, midi, 3);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_keypress(&ev, channel, note, pressure);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_keypress(&ev, channel, note, pressure);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiControlChange(const char* deviceId, char channel, char func, char value) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[3] = {(char)(0xb0 | channel), func, value};
-        snd_rawmidi_write(it->second, midi, 3);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[3] = {(char)(0xb0 | channel), func, value};
+            snd_rawmidi_write(it->second, midi, 3);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_controller(&ev, channel, func, value);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_controller(&ev, channel, func, value);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiProgramChange(const char* deviceId, char channel, char program) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[2] = {(char)(0xc0 | channel), program};
-        snd_rawmidi_write(it->second, midi, 2);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[2] = {(char)(0xc0 | channel), program};
+            snd_rawmidi_write(it->second, midi, 2);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_pgmchange(&ev, channel, program);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_pgmchange(&ev, channel, program);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiChannelAftertouch(const char* deviceId, char channel, char pressure) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[2] = {(char)(0xd0 | channel), pressure};
-        snd_rawmidi_write(it->second, midi, 2);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[2] = {(char)(0xd0 | channel), pressure};
+            snd_rawmidi_write(it->second, midi, 2);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_chanpress(&ev, channel, pressure);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_chanpress(&ev, channel, pressure);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiPitchWheel(const char* deviceId, char channel, short amount) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[3] = {(char)(0xe0 | channel), (char)(amount & 0x7f), (char)((amount >> 7) & 0x7f)};
-        snd_rawmidi_write(it->second, midi, 3);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[3] = {(char)(0xe0 | channel), (char)(amount & 0x7f), (char)((amount >> 7) & 0x7f)};
+            snd_rawmidi_write(it->second, midi, 3);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_pitchbend(&ev, channel, amount - 8192);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_pitchbend(&ev, channel, amount - 8192);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiSystemExclusive(const char* deviceId, unsigned char* data, int length) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        snd_rawmidi_write(it->second, data, length);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            snd_rawmidi_write(it->second, data, length);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_sysex(&ev, length, data);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_sysex(&ev, length, data);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiTimeCodeQuarterFrame(const char* deviceId, char value) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[2] = {(char)0xf1, value};
@@ -888,6 +969,7 @@ void SendMidiTimeCodeQuarterFrame(const char* deviceId, char value) {
 }
 
 void SendMidiSongPositionPointer(const char* deviceId, short position) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[3] = {(char)0xf2, (char)(position & 0x7f), (char)((position >> 7) & 0x7f)};
@@ -896,6 +978,7 @@ void SendMidiSongPositionPointer(const char* deviceId, short position) {
 }
 
 void SendMidiSongSelect(const char* deviceId, char song) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[2] = {(char)0xf3, song};
@@ -904,6 +987,7 @@ void SendMidiSongSelect(const char* deviceId, char song) {
 }
 
 void SendMidiTuneRequest(const char* deviceId) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[1] = {(char)0xf6};
@@ -912,6 +996,7 @@ void SendMidiTuneRequest(const char* deviceId) {
 }
 
 void SendMidiTimingClock(const char* deviceId) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[1] = {(char)0xf8};
@@ -920,69 +1005,88 @@ void SendMidiTimingClock(const char* deviceId) {
 }
 
 void SendMidiStart(const char* deviceId) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[1] = {(char)0xfa};
-        snd_rawmidi_write(it->second, midi, 1);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[1] = {(char)0xfa};
+            snd_rawmidi_write(it->second, midi, 1);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_queue_start(&ev, SND_SEQ_QUEUE_DIRECT);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_queue_start(&ev, SND_SEQ_QUEUE_DIRECT);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiContinue(const char* deviceId) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[1] = {(char)0xfb};
-        snd_rawmidi_write(it->second, midi, 1);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[1] = {(char)0xfb};
+            snd_rawmidi_write(it->second, midi, 1);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_queue_continue(&ev, SND_SEQ_QUEUE_DIRECT);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_queue_continue(&ev, SND_SEQ_QUEUE_DIRECT);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiStop(const char* deviceId) {
-    decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
-    if (it != midiOutputMap.end()) {
-        char midi[1] = {(char)0xfc};
-        snd_rawmidi_write(it->second, midi, 1);
+    {
+        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+        decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
+        if (it != midiOutputMap.end()) {
+            char midi[1] = {(char)0xfc};
+            snd_rawmidi_write(it->second, midi, 1);
+        }
     }
 
-    decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-    if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-        snd_seq_event_t ev;
-        snd_seq_ev_clear(&ev);
-        snd_seq_ev_set_direct(&ev);
+    {
+        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
+        decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
+        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+            snd_seq_event_t ev;
+            snd_seq_ev_clear(&ev);
+            snd_seq_ev_set_direct(&ev);
 
-        snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
-        snd_seq_ev_set_queue_stop(&ev, SND_SEQ_QUEUE_DIRECT);
-        snd_seq_event_output(seq_handle, &ev);
-        snd_seq_drain_output(seq_handle);
+            snd_seq_ev_set_queue_stop(&ev, SND_SEQ_QUEUE_DIRECT);
+            snd_seq_event_output(seq_handle, &ev);
+            snd_seq_drain_output(seq_handle);
+        }
     }
 }
 
 void SendMidiActiveSensing(const char* deviceId) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[1] = {(char)0xfe};
@@ -991,6 +1095,7 @@ void SendMidiActiveSensing(const char* deviceId) {
 }
 
 void SendMidiReset(const char* deviceId) {
+    std::lock_guard<std::mutex> lock(midiOutputMapMutex);
     decltype(midiOutputMap)::iterator it = midiOutputMap.find(deviceId);
     if (it != midiOutputMap.end()) {
         char midi[1] = {(char)0xff};
