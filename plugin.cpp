@@ -475,8 +475,8 @@ void midiConnectionWatcher() {
     std::set<std::string> currentConnections;
     std::set<std::string> connectionsToRemove;
 
-    // virtual midi
     while (!isStopped) {
+        // virtual midi
         currentConnections.clear();
         snd_seq_client_info_set_client(cinfo, -1);
         while (snd_seq_query_next_client(seq_handle, cinfo) >= 0) {
@@ -657,6 +657,23 @@ void midiConnectionWatcher() {
         }
 
         std::this_thread::sleep_for(100ms);
+    }
+
+    // terminated, cleanup
+    for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiInputMap.begin(); it != virtualMidiInputMap.end(); ++it) {
+        virtualMidiInputMap.erase(it->first);
+    }
+    for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiOutputMap.begin(); it != virtualMidiOutputMap.end(); ++it) {
+        virtualMidiOutputMap.erase(it->first);
+    }
+    for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.begin(); it != midiInputMap.end(); ++it) {
+        midiInputMap.erase(it->first);
+    }
+    for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiOutputMap.begin(); it != midiOutputMap.end(); ++it) {
+        midiOutputMap.erase(it->first);
+    }
+    for (std::map<std::string, std::string>::iterator it = deviceNames.begin(); it != deviceNames.end(); ++it) {
+        deviceNames.erase(it->first);
     }
 }
 
