@@ -774,6 +774,54 @@ static std::string rawmidiSubdeviceName(snd_ctl_t *ctl, snd_rawmidi_info_t *info
     return fallbackName != nullptr ? fallbackName : "";
 }
 
+static std::string hwCardDeviceKey(int card, int device) {
+    char key[32];
+    sprintf(key, "%d:%d", card, device);
+    return key;
+}
+
+static bool fillRawmidiInfo(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int device) {
+    snd_rawmidi_info_set_device(info, device);
+    snd_rawmidi_info_set_subdevice(info, 0);
+    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
+    if (snd_ctl_rawmidi_info(ctl, info) >= 0) {
+        return true;
+    }
+    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
+    return snd_ctl_rawmidi_info(ctl, info) >= 0;
+}
+
+static void recordUmpOccupiedDevices(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int card, int umpDevice,
+                                     std::set<std::string> *occupied) {
+    occupied->insert(hwCardDeviceKey(card, umpDevice));
+    if (!fillRawmidiInfo(ctl, info, umpDevice)) {
+        return;
+    }
+    int tied = snd_rawmidi_info_get_tied_device(info);
+    if (tied >= 0) {
+        occupied->insert(hwCardDeviceKey(card, tied));
+    }
+}
+
+static bool shouldSkipMidi1Rawmidi(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int card, int device,
+                                  bool midi2Enabled, const std::set<std::string> &umpOccupied) {
+    if (!fillRawmidiInfo(ctl, info, device)) {
+        return false;
+    }
+#ifdef SND_RAWMIDI_INFO_UMP
+    if (snd_rawmidi_info_get_flags(info) & SND_RAWMIDI_INFO_UMP) {
+        return true;
+    }
+#endif
+    if (!midi2Enabled) {
+        return false;
+    }
+    if (umpOccupied.find(hwCardDeviceKey(card, device)) != umpOccupied.end()) {
+        return true;
+    }
+    return snd_rawmidi_info_get_tied_device(info) >= 0;
+}
+
 void midiConnectionWatcher() {
     using namespace std::chrono_literals;
 
@@ -815,10 +863,12 @@ void midiConnectionWatcher() {
     // current connections to detect detached
     std::set<std::string> currentConnections;
     std::set<std::string> connectionsToRemove;
+    std::set<std::string> umpOccupiedHw;
 
     while (!isStopped) {
         // virtual midi
         currentConnections.clear();
+        umpOccupiedHw.clear();
         SeqClient *querySeq = selectQuerySeq();
         if (querySeq != nullptr) {
         snd_seq_client_info_set_client(cinfo, -1);
@@ -1000,6 +1050,7 @@ void midiConnectionWatcher() {
                     if (status < 0 || device < 0) {
                         break;
                     }
+                    recordUmpOccupiedDevices(ctl, info, card, device, &umpOccupiedHw);
                     snd_rawmidi_info_set_device(info, device);
 
                     // NOTE: this needs ALSA 1.2.13
@@ -1080,6 +1131,9 @@ void midiConnectionWatcher() {
                     if (status < 0 || device < 0) {
                         break;
                     }
+                    if (shouldSkipMidi1Rawmidi(ctl, info, card, device, isMidi2Enabled, umpOccupiedHw)) {
+                        continue;
+                    }
                     snd_rawmidi_info_set_device(info, device);
 
                     // sub devices: input
@@ -1120,7 +1174,6 @@ void midiConnectionWatcher() {
                         std::lock_guard<std::mutex> lock(midiOutputMapMutex);
                         if (midiOutputMap.find(deviceId) == midiOutputMap.end()) {
                             snd_rawmidi_t* midiOutput = NULL;
-                            // TODO FIXME: When MIDI1 and MIDI2 protocols coexist on one device, error -16 is returned.
                             snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_NONBLOCK);
                             if (midiOutput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
