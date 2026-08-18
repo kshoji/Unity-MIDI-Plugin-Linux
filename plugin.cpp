@@ -742,6 +742,38 @@ static int check_permission(snd_seq_port_info_t *pinfo, int perm) {
     return 0;
 }
 
+static int rawmidiSubdeviceCount(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int device, snd_rawmidi_stream_t stream) {
+    snd_rawmidi_info_set_device(info, device);
+    snd_rawmidi_info_set_stream(info, stream);
+    snd_rawmidi_info_set_subdevice(info, 0);
+    if (snd_ctl_rawmidi_info(ctl, info) < 0) {
+        return 0;
+    }
+    return static_cast<int>(snd_rawmidi_info_get_subdevices_count(info));
+}
+
+static std::string rawmidiSubdeviceName(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int device,
+                                       snd_rawmidi_stream_t stream, int sub, const char *fallbackName) {
+    snd_rawmidi_info_set_device(info, device);
+    snd_rawmidi_info_set_stream(info, stream);
+    snd_rawmidi_info_set_subdevice(info, sub);
+    if (snd_ctl_rawmidi_info(ctl, info) < 0) {
+        return fallbackName != nullptr ? fallbackName : "";
+    }
+
+    const char *subName = snd_rawmidi_info_get_subdevice_name(info);
+    if (subName != nullptr && subName[0] != '\0') {
+        return subName;
+    }
+
+    const char *devName = snd_rawmidi_info_get_name(info);
+    if (devName != nullptr && devName[0] != '\0') {
+        return devName;
+    }
+
+    return fallbackName != nullptr ? fallbackName : "";
+}
+
 void midiConnectionWatcher() {
     using namespace std::chrono_literals;
 
@@ -975,9 +1007,7 @@ void midiConnectionWatcher() {
                     snd_ctl_ump_endpoint_info(ctl, umpinfo);
 
                     // sub devices: input
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_INPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hw2i:%d-%d-%d", card, device, sub);
@@ -989,7 +1019,8 @@ void midiConnectionWatcher() {
                             snd_ump_open(&midiInput, NULL, sub_name, 0);
                             if (midiInput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_INPUT, sub, deviceName)));
                                 }
                                 midi2InputMap.insert(std::make_pair(deviceId, midiInput));
 
@@ -1005,9 +1036,7 @@ void midiConnectionWatcher() {
 
                     snd_ctl_ump_endpoint_info(ctl, umpinfo);
                     // sub devices: output
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hw2o:%d-%d-%d", card, device, sub);
@@ -1019,7 +1048,8 @@ void midiConnectionWatcher() {
                             int openResult = snd_ump_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_NONBLOCK); // never returns 
                             if (midiOutput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT, sub, deviceName)));
                                 }
                                 midi2OutputMap.insert(std::make_pair(deviceId, midiOutput));
 
@@ -1053,9 +1083,7 @@ void midiConnectionWatcher() {
                     snd_rawmidi_info_set_device(info, device);
 
                     // sub devices: input
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_INPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hwi:%d-%d-%d", card, device, sub);
@@ -1067,7 +1095,8 @@ void midiConnectionWatcher() {
                             snd_rawmidi_open(&midiInput, NULL, sub_name, 0);
                             if (midiInput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_INPUT, sub, deviceName)));
                                 }
                                 midiInputMap.insert(std::make_pair(deviceId, midiInput));
 
@@ -1082,9 +1111,7 @@ void midiConnectionWatcher() {
                     }
 
                     // sub devices: output
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hwo:%d-%d-%d", card, device, sub);
@@ -1097,7 +1124,8 @@ void midiConnectionWatcher() {
                             snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_NONBLOCK);
                             if (midiOutput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT, sub, deviceName)));
                                 }
                                 midiOutputMap.insert(std::make_pair(deviceId, midiOutput));
 
