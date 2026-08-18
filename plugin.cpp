@@ -220,6 +220,38 @@ static void sendSeqRealtimeEvent(const snd_seq_addr_t &dest, snd_seq_event_type_
     outputSeqEvent(seqMidi1, &ev);
 }
 
+// UMP packet size in 32-bit words, from the message type in bits 31-28 of the first word.
+static int umpPacketWordCount(uint32_t firstWord) {
+    static const int kWords[16] = {
+        1, 1, 1, 2, 2, 4, 1, 1, 2, 2, 2, 3, 4, 4, 4, 4
+    };
+    return kWords[(firstWord >> 28) & 0x0f];
+}
+
+static void sendUmpMessageToUnity(const char *deviceId, const uint32_t *ump, int wordCount) {
+    if (deviceId == nullptr || ump == nullptr || wordCount <= 0) {
+        return;
+    }
+    std::ostringstream oss;
+    oss << deviceId;
+    for (int i = 0; i < wordCount; ++i) {
+        oss << "," << ump[i];
+    }
+    UnitySendMessage(GAME_OBJECT_NAME, "OnUmpMessage", oss.str().c_str());
+}
+
+static void dispatchUmpWords(const char *deviceId, const uint32_t *ump, int wordCount) {
+    int offset = 0;
+    while (offset < wordCount) {
+        int packetWords = umpPacketWordCount(ump[offset]);
+        if (offset + packetWords > wordCount) {
+            packetWords = wordCount - offset;
+        }
+        sendUmpMessageToUnity(deviceId, ump + offset, packetWords);
+        offset += packetWords;
+    }
+}
+
 void virtualMidiEventWatcher() {
     using namespace std::chrono_literals;
     char deviceId[32];
@@ -383,13 +415,7 @@ void virtualMidi2EventWatcher() {
 
         // UMP clients set SND_SEQ_EVENT_UMP in flags and leave type as 0
         if ((ev.flags & SND_SEQ_EVENT_UMP) != 0 || ev.type == SND_SEQ_EVENT_UMP) {
-            std::ostringstream oss;
-            oss << deviceId;
-            oss << "," << ev.ump[0];
-            oss << "," << ev.ump[1];
-            oss << "," << ev.ump[2];
-            oss << "," << ev.ump[3];
-            UnitySendMessage(GAME_OBJECT_NAME, "OnUmpMessage", oss.str().c_str());
+            dispatchUmpWords(deviceId, ev.ump, umpPacketWordCount(ev.ump[0]));
         }
     }
 }
@@ -677,14 +703,8 @@ void midi2EventWatcher(std::string deviceIdStr, snd_ump_t* midiInput) {
         }
 
         if (read > 0) {
-            // parse UMP
-            std::ostringstream oss;
-            oss << deviceIdStr;
-            for (ssize_t i = 0; i < read; i++) {
-                oss << ",";
-                oss << buffer[i];
-            }
-            UnitySendMessage(GAME_OBJECT_NAME, "OnUmpMessage", oss.str().c_str());
+            ssize_t wordCount = read / static_cast<ssize_t>(sizeof(uint32_t));
+            dispatchUmpWords(deviceIdStr.c_str(), buffer, static_cast<int>(wordCount));
         }
 
         std::this_thread::sleep_for(10ms);
@@ -1561,11 +1581,15 @@ void SendMidiReset(const char* deviceId) {
 }
 
 void SendUmpMessage(const char* deviceId, uint32_t* ump, int length) {
+    if (ump == nullptr || length <= 0) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(midi2OutputMapMutex);
         decltype(midi2OutputMap)::iterator it = midi2OutputMap.find(deviceId);
         if (it != midi2OutputMap.end()) {
-            snd_ump_write(it->second, ump, length*sizeof(uint32_t));
+            snd_ump_write(it->second, ump, static_cast<size_t>(length) * sizeof(uint32_t));
         }
     }
 
@@ -1573,13 +1597,24 @@ void SendUmpMessage(const char* deviceId, uint32_t* ump, int length) {
         std::lock_guard<std::mutex> lock(virtualMidi2OutputMapMutex);
         decltype(virtualMidi2OutputMap)::iterator it2 = virtualMidi2OutputMap.find(deviceId);
         if (it2 != virtualMidi2OutputMap.end()) {
-            snd_seq_ump_event_t ev;
-            initSeqUmpEventDirect(&ev, seqMidi2.portNumber, it2->second);
-            snd_seq_ev_set_ump(&ev);
+            int offset = 0;
+            while (offset < length) {
+                int packetWords = umpPacketWordCount(ump[offset]);
+                if (offset + packetWords > length) {
+                    packetWords = length - offset;
+                }
+                if (packetWords > 4) {
+                    packetWords = 4;
+                }
 
-            // https://github.com/alsa-project/alsa-lib/blob/master/include/seqmid.h#L322-L329
-            snd_seq_ev_set_ump_data(&ev, ump, length);
-            outputSeqUmpEvent(seqMidi2, &ev);
+                snd_seq_ump_event_t ev;
+                initSeqUmpEventDirect(&ev, seqMidi2.portNumber, it2->second);
+                snd_seq_ev_set_ump(&ev);
+                // snd_seq_ev_set_ump_data takes a byte count, max 16
+                snd_seq_ev_set_ump_data(&ev, ump + offset, static_cast<size_t>(packetWords) * sizeof(uint32_t));
+                outputSeqUmpEvent(seqMidi2, &ev);
+                offset += packetWords;
+            }
         }
     }
 }
