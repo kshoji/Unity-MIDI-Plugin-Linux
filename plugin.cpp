@@ -88,6 +88,45 @@ void UnitySendMessage(const char* obj, const char* method, const char* msg) {
     }
 }
 
+static bool subscribeSeqInput(const snd_seq_addr_t &addr) {
+    if (seq_handle == nullptr || selfPortNumber < 0) {
+        return false;
+    }
+    int err = snd_seq_connect_from(seq_handle, selfPortNumber, addr.client, addr.port);
+    // already subscribed is not a failure; the port still delivers events to us
+    return err >= 0 || err == -EBUSY;
+}
+
+static void unsubscribeSeqInput(const snd_seq_addr_t &addr) {
+    if (seq_handle == nullptr || selfPortNumber < 0) {
+        return;
+    }
+    snd_seq_disconnect_from(seq_handle, selfPortNumber, addr.client, addr.port);
+}
+
+static void initSeqEventDirect(snd_seq_event_t *ev, const snd_seq_addr_t &dest) {
+    snd_seq_ev_clear(ev);
+    snd_seq_ev_set_source(ev, selfPortNumber);
+    snd_seq_ev_set_dest(ev, dest.client, dest.port);
+    snd_seq_ev_set_direct(ev);
+}
+
+static void initSeqUmpEventDirect(snd_seq_ump_event_t *ev, const snd_seq_addr_t &dest) {
+    snd_seq_ump_ev_clear(ev);
+    snd_seq_ev_set_source(ev, selfPortNumber);
+    snd_seq_ev_set_dest(ev, dest.client, dest.port);
+    snd_seq_ev_set_direct(ev);
+}
+
+static void sendSeqRealtimeEvent(const snd_seq_addr_t &dest, snd_seq_event_type_t type) {
+    snd_seq_event_t ev;
+    initSeqEventDirect(&ev, dest);
+    ev.type = type;
+    snd_seq_ev_set_fixed(&ev);
+    snd_seq_event_output(seq_handle, &ev);
+    snd_seq_drain_output(seq_handle);
+}
+
 void virtualMidiEventWatcher() {
     using namespace std::chrono_literals;
     snd_seq_event_t *ev = nullptr;
@@ -104,7 +143,7 @@ void virtualMidiEventWatcher() {
             continue;
         }
 
-        sprintf(deviceId, "seq:%d-%d", ev->data.addr.client, ev->data.addr.port);
+        sprintf(deviceId, "seq:%d-%d", ev->source.client, ev->source.port);
         {
             std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
             if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
@@ -654,7 +693,7 @@ void midiConnectionWatcher() {
                     if (midi_version == 0) {
                         if (isMidi1Enabled) {
                             std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
-                            if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
+                            if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end() && subscribeSeqInput(addr)) {
                                 const char* deviceName = snd_seq_client_info_get_name(cinfo);
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
                                     deviceNames.insert(std::make_pair(deviceId, deviceName));
@@ -667,7 +706,7 @@ void midiConnectionWatcher() {
                     } else if (midi_version == 1 || midi_version == 2) {
                         if (isMidi2Enabled) {
                             std::lock_guard<std::mutex> lock(virtualMidi2InputMapMutex);
-                            if (virtualMidi2InputMap.find(deviceId) == virtualMidi2InputMap.end()) {
+                            if (virtualMidi2InputMap.find(deviceId) == virtualMidi2InputMap.end() && subscribeSeqInput(addr)) {
                                 const char* deviceName = snd_seq_client_info_get_name(cinfo);
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
                                     deviceNames.insert(std::make_pair(deviceId, deviceName));
@@ -727,7 +766,11 @@ void midiConnectionWatcher() {
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                virtualMidiInputMap.erase(*it);
+                std::map<std::string, snd_seq_addr_t>::iterator found = virtualMidiInputMap.find(*it);
+                if (found != virtualMidiInputMap.end()) {
+                    unsubscribeSeqInput(found->second);
+                    virtualMidiInputMap.erase(found);
+                }
             }
         }
         {
@@ -754,7 +797,11 @@ void midiConnectionWatcher() {
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                virtualMidi2InputMap.erase(*it);
+                std::map<std::string, snd_seq_addr_t>::iterator found = virtualMidi2InputMap.find(*it);
+                if (found != virtualMidi2InputMap.end()) {
+                    unsubscribeSeqInput(found->second);
+                    virtualMidi2InputMap.erase(found);
+                }
             }
         }
         {
@@ -994,6 +1041,9 @@ void midiConnectionWatcher() {
     // terminated, cleanup
     {
         std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
+        for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidiInputMap.begin(); it != virtualMidiInputMap.end(); ++it) {
+            unsubscribeSeqInput(it->second);
+        }
         virtualMidiInputMap.clear();
     }
     {
@@ -1002,6 +1052,9 @@ void midiConnectionWatcher() {
     }
     {
         std::lock_guard<std::mutex> lock(virtualMidi2InputMapMutex);
+        for (std::map<std::string, snd_seq_addr_t>::iterator it = virtualMidi2InputMap.begin(); it != virtualMidi2InputMap.end(); ++it) {
+            unsubscribeSeqInput(it->second);
+        }
         virtualMidi2InputMap.clear();
     }
     {
@@ -1118,10 +1171,7 @@ void SendMidiNoteOff(const char* deviceId, char channel, char note, char velocit
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_noteoff(&ev, channel, note, velocity);
             snd_seq_event_output(seq_handle, &ev);
@@ -1146,10 +1196,7 @@ void SendMidiNoteOn(const char* deviceId, char channel, char note, char velocity
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_noteon(&ev, channel, note, velocity);
             snd_seq_event_output(seq_handle, &ev);
@@ -1174,10 +1221,7 @@ void SendMidiPolyphonicAftertouch(const char* deviceId, char channel, char note,
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_keypress(&ev, channel, note, pressure);
             snd_seq_event_output(seq_handle, &ev);
@@ -1202,10 +1246,7 @@ void SendMidiControlChange(const char* deviceId, char channel, char func, char v
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_controller(&ev, channel, func, value);
             snd_seq_event_output(seq_handle, &ev);
@@ -1230,10 +1271,7 @@ void SendMidiProgramChange(const char* deviceId, char channel, char program) {
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_pgmchange(&ev, channel, program);
             snd_seq_event_output(seq_handle, &ev);
@@ -1258,10 +1296,7 @@ void SendMidiChannelAftertouch(const char* deviceId, char channel, char pressure
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_chanpress(&ev, channel, pressure);
             snd_seq_event_output(seq_handle, &ev);
@@ -1286,10 +1321,7 @@ void SendMidiPitchWheel(const char* deviceId, char channel, short amount) {
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_pitchbend(&ev, channel, amount - 8192);
             snd_seq_event_output(seq_handle, &ev);
@@ -1313,10 +1345,7 @@ void SendMidiSystemExclusive(const char* deviceId, unsigned char* data, int leng
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, it2->second);
 
             snd_seq_ev_set_sysex(&ev, length, data);
             snd_seq_event_output(seq_handle, &ev);
@@ -1390,15 +1419,7 @@ void SendMidiStart(const char* deviceId) {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            snd_seq_ev_set_queue_start(&ev, SND_SEQ_QUEUE_DIRECT);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            sendSeqRealtimeEvent(it2->second, SND_SEQ_EVENT_START);
         }
     }
 }
@@ -1418,15 +1439,7 @@ void SendMidiContinue(const char* deviceId) {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            snd_seq_ev_set_queue_continue(&ev, SND_SEQ_QUEUE_DIRECT);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            sendSeqRealtimeEvent(it2->second, SND_SEQ_EVENT_CONTINUE);
         }
     }
 }
@@ -1446,15 +1459,7 @@ void SendMidiStop(const char* deviceId) {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
         if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            snd_seq_ev_set_queue_stop(&ev, SND_SEQ_QUEUE_DIRECT);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            sendSeqRealtimeEvent(it2->second, SND_SEQ_EVENT_STOP);
         }
     }
 }
@@ -1493,11 +1498,8 @@ void SendUmpMessage(const char* deviceId, uint32_t* ump, int length) {
         decltype(virtualMidi2OutputMap)::iterator it2 = virtualMidi2OutputMap.find(deviceId);
         if (it2 != virtualMidi2OutputMap.end() && seq_handle != nullptr) {
             snd_seq_ump_event_t ev;
-            snd_seq_ump_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
+            initSeqUmpEventDirect(&ev, it2->second);
             snd_seq_ev_set_ump(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
 
             // https://github.com/alsa-project/alsa-lib/blob/master/include/seqmid.h#L322-L329
             snd_seq_ev_set_ump_data(&ev, ump, length);
