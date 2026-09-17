@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <poll.h>
 #include <set>
 #include <sstream>
 #include <string>
@@ -70,11 +72,24 @@ std::mutex virtualMidi2InputMapMutex;
 std::mutex virtualMidi2OutputMapMutex;
 std::mutex deviceNamesMutex;
 
-snd_seq_t *seq_handle = nullptr;
-int selfClientId;
-int selfPortNumber;
+struct SeqClient {
+    snd_seq_t *handle;
+    std::mutex mutex;
+    int clientId;
+    int portNumber;
+
+    SeqClient() : handle(nullptr), clientId(-1), portNumber(-1) {}
+};
+
+SeqClient seqMidi1;
+SeqClient seqMidi2;
 
 const char *GAME_OBJECT_NAME = "MidiManager";
+const unsigned int SEQ_PORT_CAPS_MIDI1 =
+    SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ |
+    SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE;
+const unsigned int SEQ_PORT_CAPS_MIDI2 =
+    SEQ_PORT_CAPS_MIDI1 | SND_SEQ_PORT_CAP_UMP_ENDPOINT;
 
 volatile bool isStopped = true;
 volatile bool isMidi1Enabled = false;
@@ -88,86 +103,386 @@ void UnitySendMessage(const char* obj, const char* method, const char* msg) {
     }
 }
 
+static bool openSeqClient(SeqClient &client, const char *name, int midiVersion, unsigned int caps) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle != nullptr) {
+        return true;
+    }
+
+    if (snd_seq_open(&client.handle, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK) < 0) {
+        client.handle = nullptr;
+        return false;
+    }
+
+    snd_seq_set_client_name(client.handle, name);
+    if (midiVersion != SND_SEQ_CLIENT_LEGACY_MIDI) {
+        snd_seq_set_client_midi_version(client.handle, midiVersion);
+    }
+
+    client.clientId = snd_seq_client_id(client.handle);
+    client.portNumber = snd_seq_create_simple_port(client.handle, "inout", caps, SND_SEQ_PORT_TYPE_APPLICATION);
+    if (client.portNumber < 0) {
+        snd_seq_close(client.handle);
+        client.handle = nullptr;
+        client.clientId = -1;
+        return false;
+    }
+
+    return true;
+}
+
+static void closeSeqClient(SeqClient &client) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle != nullptr) {
+        snd_seq_close(client.handle);
+        client.handle = nullptr;
+        client.clientId = -1;
+        client.portNumber = -1;
+    }
+}
+
+static void unsubscribeSeqInput(SeqClient &client, const snd_seq_addr_t &addr);
+
+static const int kPollTimeoutMs = 100;
+
+static bool pollSeqClient(SeqClient &client) {
+    struct pollfd pfds[8];
+    int npfds = 0;
+    {
+        std::lock_guard<std::mutex> lock(client.mutex);
+        if (client.handle == nullptr) {
+            return false;
+        }
+        npfds = snd_seq_poll_descriptors_count(client.handle, POLLIN);
+        if (npfds > 8) {
+            npfds = 8;
+        }
+        if (npfds > 0) {
+            snd_seq_poll_descriptors(client.handle, pfds, npfds, POLLIN);
+        }
+    }
+    if (npfds <= 0) {
+        return false;
+    }
+    return poll(pfds, npfds, kPollTimeoutMs) > 0;
+}
+
+static snd_rawmidi_t *stealRawmidi(std::map<std::string, snd_rawmidi_t*> &devices, std::mutex &mutex, const std::string &id) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::map<std::string, snd_rawmidi_t*>::iterator it = devices.find(id);
+    if (it == devices.end()) {
+        return nullptr;
+    }
+    snd_rawmidi_t *handle = it->second;
+    devices.erase(it);
+    return handle;
+}
+
+static snd_ump_t *stealUmp(std::map<std::string, snd_ump_t*> &devices, std::mutex &mutex, const std::string &id) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::map<std::string, snd_ump_t*>::iterator it = devices.find(id);
+    if (it == devices.end()) {
+        return nullptr;
+    }
+    snd_ump_t *handle = it->second;
+    devices.erase(it);
+    return handle;
+}
+
+static void closeRawmidiAndNotify(std::map<std::string, snd_rawmidi_t*> &devices, std::mutex &mutex,
+                                  const std::string &id, const char *detachMethod) {
+    snd_rawmidi_t *handle = stealRawmidi(devices, mutex, id);
+    if (handle != nullptr) {
+        snd_rawmidi_close(handle);
+        UnitySendMessage(GAME_OBJECT_NAME, detachMethod, id.c_str());
+    }
+}
+
+static void closeUmpAndNotify(std::map<std::string, snd_ump_t*> &devices, std::mutex &mutex,
+                              const std::string &id, const char *detachMethod) {
+    snd_ump_t *handle = stealUmp(devices, mutex, id);
+    if (handle != nullptr) {
+        snd_ump_close(handle);
+        UnitySendMessage(GAME_OBJECT_NAME, detachMethod, id.c_str());
+    }
+}
+
+static void closeAllRawmidiAndNotify(std::map<std::string, snd_rawmidi_t*> &devices, std::mutex &mutex,
+                                     const char *detachMethod) {
+    std::map<std::string, snd_rawmidi_t*> stolen;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stolen.swap(devices);
+    }
+    for (std::map<std::string, snd_rawmidi_t*>::iterator it = stolen.begin(); it != stolen.end(); ++it) {
+        if (it->second != nullptr) {
+            snd_rawmidi_close(it->second);
+        }
+        UnitySendMessage(GAME_OBJECT_NAME, detachMethod, it->first.c_str());
+    }
+}
+
+static void closeAllUmpAndNotify(std::map<std::string, snd_ump_t*> &devices, std::mutex &mutex,
+                                 const char *detachMethod) {
+    std::map<std::string, snd_ump_t*> stolen;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stolen.swap(devices);
+    }
+    for (std::map<std::string, snd_ump_t*>::iterator it = stolen.begin(); it != stolen.end(); ++it) {
+        if (it->second != nullptr) {
+            snd_ump_close(it->second);
+        }
+        UnitySendMessage(GAME_OBJECT_NAME, detachMethod, it->first.c_str());
+    }
+}
+
+static void clearVirtualSeqMap(std::map<std::string, snd_seq_addr_t> &devices, std::mutex &mutex,
+                               SeqClient *seqClient, const char *detachMethod) {
+    std::map<std::string, snd_seq_addr_t> stolen;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stolen.swap(devices);
+    }
+    for (std::map<std::string, snd_seq_addr_t>::iterator it = stolen.begin(); it != stolen.end(); ++it) {
+        if (seqClient != nullptr) {
+            unsubscribeSeqInput(*seqClient, it->second);
+        }
+        UnitySendMessage(GAME_OBJECT_NAME, detachMethod, it->first.c_str());
+    }
+}
+
+static void shutdownMidi1Resources() {
+    clearVirtualSeqMap(virtualMidiInputMap, virtualMidiInputMapMutex, &seqMidi1, "OnMidiInputDeviceDetached");
+    clearVirtualSeqMap(virtualMidiOutputMap, virtualMidiOutputMapMutex, nullptr, "OnMidiOutputDeviceDetached");
+    closeAllRawmidiAndNotify(midiInputMap, midiInputMapMutex, "OnMidiInputDeviceDetached");
+    closeAllRawmidiAndNotify(midiOutputMap, midiOutputMapMutex, "OnMidiOutputDeviceDetached");
+    closeSeqClient(seqMidi1);
+}
+
+static void shutdownMidi2Resources() {
+    clearVirtualSeqMap(virtualMidi2InputMap, virtualMidi2InputMapMutex, &seqMidi2, "OnMidi2InputDeviceDetached");
+    clearVirtualSeqMap(virtualMidi2OutputMap, virtualMidi2OutputMapMutex, nullptr, "OnMidi2OutputDeviceDetached");
+    closeAllUmpAndNotify(midi2InputMap, midi2InputMapMutex, "OnMidi2InputDeviceDetached");
+    closeAllUmpAndNotify(midi2OutputMap, midi2OutputMapMutex, "OnMidi2OutputDeviceDetached");
+    closeSeqClient(seqMidi2);
+}
+
+static bool subscribeSeqInput(SeqClient &client, const snd_seq_addr_t &addr) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle == nullptr || client.portNumber < 0) {
+        return false;
+    }
+    int err = snd_seq_connect_from(client.handle, client.portNumber, addr.client, addr.port);
+    // already subscribed is not a failure; the port still delivers events to us
+    return err >= 0 || err == -EBUSY;
+}
+
+static void unsubscribeSeqInput(SeqClient &client, const snd_seq_addr_t &addr) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle == nullptr || client.portNumber < 0) {
+        return;
+    }
+    snd_seq_disconnect_from(client.handle, client.portNumber, addr.client, addr.port);
+}
+
+static SeqClient *selectQuerySeq() {
+    {
+        std::lock_guard<std::mutex> lock(seqMidi1.mutex);
+        if (seqMidi1.handle != nullptr) {
+            return &seqMidi1;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(seqMidi2.mutex);
+        if (seqMidi2.handle != nullptr) {
+            return &seqMidi2;
+        }
+    }
+    return nullptr;
+}
+
+static int seqQueryNextClient(SeqClient &client, snd_seq_client_info_t *cinfo) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle == nullptr) {
+        return -ENODEV;
+    }
+    return snd_seq_query_next_client(client.handle, cinfo);
+}
+
+static int seqQueryNextPort(SeqClient &client, snd_seq_port_info_t *pinfo) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle == nullptr) {
+        return -ENODEV;
+    }
+    return snd_seq_query_next_port(client.handle, pinfo);
+}
+
+static void initSeqEventDirect(snd_seq_event_t *ev, int sourcePort, const snd_seq_addr_t &dest) {
+    snd_seq_ev_clear(ev);
+    snd_seq_ev_set_source(ev, sourcePort);
+    snd_seq_ev_set_dest(ev, dest.client, dest.port);
+    snd_seq_ev_set_direct(ev);
+}
+
+static void initSeqUmpEventDirect(snd_seq_ump_event_t *ev, int sourcePort, const snd_seq_addr_t &dest) {
+    snd_seq_ump_ev_clear(ev);
+    snd_seq_ev_set_source(ev, sourcePort);
+    snd_seq_ev_set_dest(ev, dest.client, dest.port);
+    snd_seq_ev_set_direct(ev);
+}
+
+static void outputSeqEvent(SeqClient &client, snd_seq_event_t *ev) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle == nullptr) {
+        return;
+    }
+    snd_seq_event_output(client.handle, ev);
+    snd_seq_drain_output(client.handle);
+}
+
+static void outputSeqUmpEvent(SeqClient &client, snd_seq_ump_event_t *ev) {
+    std::lock_guard<std::mutex> lock(client.mutex);
+    if (client.handle == nullptr) {
+        return;
+    }
+    snd_seq_ump_event_output_direct(client.handle, ev);
+    snd_seq_drain_output(client.handle);
+}
+
+static void sendSeqRealtimeEvent(const snd_seq_addr_t &dest, snd_seq_event_type_t type) {
+    snd_seq_event_t ev;
+    initSeqEventDirect(&ev, seqMidi1.portNumber, dest);
+    ev.type = type;
+    snd_seq_ev_set_fixed(&ev);
+    outputSeqEvent(seqMidi1, &ev);
+}
+
+// UMP packet size in 32-bit words, from the message type in bits 31-28 of the first word.
+static int umpPacketWordCount(uint32_t firstWord) {
+    static const int kWords[16] = {
+        1, 1, 1, 2, 2, 4, 1, 1, 2, 2, 2, 3, 4, 4, 4, 4
+    };
+    return kWords[(firstWord >> 28) & 0x0f];
+}
+
+static void sendUmpMessageToUnity(const char *deviceId, const uint32_t *ump, int wordCount) {
+    if (deviceId == nullptr || ump == nullptr || wordCount <= 0) {
+        return;
+    }
+    std::ostringstream oss;
+    oss << deviceId;
+    for (int i = 0; i < wordCount; ++i) {
+        oss << "," << ump[i];
+    }
+    UnitySendMessage(GAME_OBJECT_NAME, "OnUmpMessage", oss.str().c_str());
+}
+
+static void dispatchUmpWords(const char *deviceId, const uint32_t *ump, int wordCount) {
+    int offset = 0;
+    while (offset < wordCount) {
+        int packetWords = umpPacketWordCount(ump[offset]);
+        if (offset + packetWords > wordCount) {
+            packetWords = wordCount - offset;
+        }
+        sendUmpMessageToUnity(deviceId, ump + offset, packetWords);
+        offset += packetWords;
+    }
+}
+
 void virtualMidiEventWatcher() {
     using namespace std::chrono_literals;
-    snd_seq_event_t *ev = nullptr;
     char deviceId[32];
     char eventMessage[128];
 
-    while (!isStopped && seq_handle != nullptr) {
+    while (!isStopped) {
         if (!isMidi1Enabled) {
             std::this_thread::sleep_for(10ms);
             continue;
         }
-        if (snd_seq_event_input(seq_handle, &ev) < 0) {
-            std::this_thread::sleep_for(10ms);
+        if (!pollSeqClient(seqMidi1)) {
             continue;
         }
 
-        sprintf(deviceId, "seq:%d-%d", ev->data.addr.client, ev->data.addr.port);
+        snd_seq_event_t ev;
+        std::vector<unsigned char> sysex;
+        bool haveEvent = false;
+        {
+            std::lock_guard<std::mutex> lock(seqMidi1.mutex);
+            if (seqMidi1.handle != nullptr) {
+                snd_seq_event_t *rawEv = nullptr;
+                if (snd_seq_event_input(seqMidi1.handle, &rawEv) >= 0 && rawEv != nullptr) {
+                    ev = *rawEv;
+                    haveEvent = true;
+                    if (rawEv->type == SND_SEQ_EVENT_SYSEX && rawEv->data.ext.ptr != nullptr && rawEv->data.ext.len > 0) {
+                        const unsigned char *ptr = static_cast<const unsigned char *>(rawEv->data.ext.ptr);
+                        sysex.assign(ptr, ptr + rawEv->data.ext.len);
+                    }
+                }
+            }
+        }
+
+        if (!haveEvent) {
+            continue;
+        }
+
+        sprintf(deviceId, "seq:%d-%d", ev.source.client, ev.source.port);
         {
             std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
             if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
-                // ignore if not connected
                 continue;
             }
         }
 
         // https://www.alsa-project.org/alsa-doc/alsa-lib/group___seq_events.html#gaef39e1f267006faf7abc91c3cb32ea40
-        switch (ev->type) {
+        switch (ev.type) {
             case SND_SEQ_EVENT_NOTEON:
-                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.note.channel, ev->data.note.note, ev->data.note.velocity);
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev.data.note.channel, ev.data.note.note, ev.data.note.velocity);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiNoteOn", eventMessage);
                 break;
             case SND_SEQ_EVENT_NOTEOFF:
-                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.note.channel, ev->data.note.note, ev->data.note.velocity);
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev.data.note.channel, ev.data.note.note, ev.data.note.velocity);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiNoteOff", eventMessage);
                 break;
             case SND_SEQ_EVENT_CONTROLLER:
-                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.control.channel, ev->data.control.param, ev->data.control.value);
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev.data.control.channel, ev.data.control.param, ev.data.control.value);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiControlChange", eventMessage);
                 break;
             case SND_SEQ_EVENT_PGMCHANGE:
-                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev->data.control.channel, ev->data.control.value);
+                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev.data.control.channel, ev.data.control.value);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiProgramChange", eventMessage);
                 break;
             case SND_SEQ_EVENT_CHANPRESS:
-                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev->data.control.channel, ev->data.control.value);
+                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev.data.control.channel, ev.data.control.value);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiChannelAftertouch", eventMessage);
                 break;
             case SND_SEQ_EVENT_KEYPRESS:
-                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev->data.note.channel, ev->data.note.note, ev->data.note.velocity);
+                sprintf(eventMessage, "%s,0,%d,%d,%d", deviceId, ev.data.note.channel, ev.data.note.note, ev.data.note.velocity);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiPolyphonicAftertouch", eventMessage);
                 break;
             case SND_SEQ_EVENT_PITCHBEND:
-                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev->data.control.channel, ev->data.control.value + 8192);
+                sprintf(eventMessage, "%s,0,%d,%d", deviceId, ev.data.control.channel, ev.data.control.value + 8192);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiPitchWheel", eventMessage);
                 break;
             case SND_SEQ_EVENT_SYSEX:
                 {
-                    std::vector<unsigned char> systemExclusiveStream;
-                    for (int i = 0; i < ev->data.ext.len; ++i) {
-                        systemExclusiveStream.push_back(((unsigned char *)(ev->data.ext.ptr))[i]);
-                    }
                     std::ostringstream oss;
                     oss << deviceId;
                     oss << ",0,";
-                    std::copy(systemExclusiveStream.begin(), systemExclusiveStream.end(), std::ostream_iterator<int>(oss, ","));
-                    systemExclusiveStream.clear();
-
+                    std::copy(sysex.begin(), sysex.end(), std::ostream_iterator<int>(oss, ","));
                     UnitySendMessage(GAME_OBJECT_NAME, "OnMidiSystemExclusive", oss.str().c_str());
                 }
                 break;
             case SND_SEQ_EVENT_SONGPOS:
-                sprintf(eventMessage, "%s,0,%d", deviceId, ev->data.control.value);
+                sprintf(eventMessage, "%s,0,%d", deviceId, ev.data.control.value);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiSongPositionPointer", eventMessage);
                 break;
             case SND_SEQ_EVENT_SONGSEL:
-                sprintf(eventMessage, "%s,0,%d", deviceId, ev->data.control.value);
+                sprintf(eventMessage, "%s,0,%d", deviceId, ev.data.control.value);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiSongSelect", eventMessage);
                 break;
             case SND_SEQ_EVENT_QFRAME:
-                sprintf(eventMessage, "%s,0,%d", deviceId, ev->data.control.value);
+                sprintf(eventMessage, "%s,0,%d", deviceId, ev.data.control.value);
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiTimeCodeQuarterFrame", eventMessage);
                 break;
             case SND_SEQ_EVENT_TUNE_REQUEST:
@@ -199,58 +514,57 @@ void virtualMidiEventWatcher() {
                 UnitySendMessage(GAME_OBJECT_NAME, "OnMidiReset", eventMessage);
                 break;
         }
-
-        std::this_thread::sleep_for(10ms);
     }
 }
 
 void virtualMidi2EventWatcher() {
     using namespace std::chrono_literals;
-    snd_seq_ump_event_t *ev = nullptr;
     char deviceId[32];
-    char eventMessage[128];
 
-    while (!isStopped && seq_handle != nullptr) {
+    while (!isStopped) {
         if (!isMidi2Enabled) {
             std::this_thread::sleep_for(10ms);
             continue;
         }
-        if (snd_seq_ump_event_input(seq_handle, &ev) < 0) {
-            std::this_thread::sleep_for(10ms);
+        if (!pollSeqClient(seqMidi2)) {
             continue;
         }
 
-        sprintf(deviceId, "seq:%d-%d", ev->source.client, ev->source.port);
+        snd_seq_ump_event_t ev;
+        bool haveEvent = false;
+        {
+            std::lock_guard<std::mutex> lock(seqMidi2.mutex);
+            if (seqMidi2.handle != nullptr) {
+                snd_seq_ump_event_t *rawEv = nullptr;
+                if (snd_seq_ump_event_input(seqMidi2.handle, &rawEv) >= 0 && rawEv != nullptr) {
+                    ev = *rawEv;
+                    haveEvent = true;
+                }
+            }
+        }
+
+        if (!haveEvent) {
+            continue;
+        }
+
+        sprintf(deviceId, "seq:%d-%d", ev.source.client, ev.source.port);
         {
             std::lock_guard<std::mutex> lock(virtualMidi2InputMapMutex);
             if (virtualMidi2InputMap.find(deviceId) == virtualMidi2InputMap.end()) {
-                // ignore if not connected
                 continue;
             }
         }
 
-        // https://www.alsa-project.org/alsa-doc/alsa-lib/group___seq_events.html#gaef39e1f267006faf7abc91c3cb32ea40
-        switch (ev->type) {
-            case SND_SEQ_EVENT_UMP:
-            {
-                std::ostringstream oss;
-                oss << deviceId;
-                oss << "," << ev->ump[0];
-                oss << "," << ev->ump[1];
-                oss << "," << ev->ump[2];
-                oss << "," << ev->ump[3];
-                UnitySendMessage(GAME_OBJECT_NAME, "OnUmpMessage", oss.str().c_str());
-            }
-                break;
+        // UMP clients set SND_SEQ_EVENT_UMP in flags and leave type as 0
+        if ((ev.flags & SND_SEQ_EVENT_UMP) != 0 || ev.type == SND_SEQ_EVENT_UMP) {
+            dispatchUmpWords(deviceId, ev.ump, umpPacketWordCount(ev.ump[0]));
         }
-
-        std::this_thread::sleep_for(10ms);
     }
 }
 
 void midiEventWatcher(std::string deviceIdStr, snd_rawmidi_t* midiInput) {
     using namespace std::chrono_literals;
-    ssize_t read;
+    ssize_t nread;
     unsigned char buffer[1024];
 
     // states
@@ -269,21 +583,85 @@ void midiEventWatcher(std::string deviceIdStr, snd_rawmidi_t* midiInput) {
     const char* deviceId = deviceIdStr.c_str();
 
     while (!isStopped) {
+        bool tracked = false;
+        {
+            std::lock_guard<std::mutex> lock(midiInputMapMutex);
+            std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.find(deviceIdStr);
+            tracked = it != midiInputMap.end() && it->second == midiInput;
+        }
+        if (!tracked) {
+            break;
+        }
         if (!isMidi1Enabled) {
             std::this_thread::sleep_for(10ms);
             continue;
         }
 
-        read = snd_rawmidi_read(midiInput, buffer, sizeof(buffer));
-        if (read < 0) {
-            // failed, stop this device
-            snd_rawmidi_close(midiInput);
+        struct pollfd pfds[8];
+        int npfd = 0;
+        {
+            std::lock_guard<std::mutex> lock(midiInputMapMutex);
+            std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.find(deviceIdStr);
+            if (it == midiInputMap.end() || it->second != midiInput) {
+                break;
+            }
+            npfd = snd_rawmidi_poll_descriptors_count(midiInput);
+            if (npfd > 8) {
+                npfd = 8;
+            }
+            if (npfd > 0) {
+                snd_rawmidi_poll_descriptors(midiInput, pfds, npfd);
+            }
+        }
+        if (npfd <= 0) {
+            std::this_thread::sleep_for(10ms);
+            continue;
+        }
+
+        int pret = poll(pfds, npfd, kPollTimeoutMs);
+        if (pret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pret == 0) {
+            continue;
+        }
+
+        nread = 0;
+        bool closedByError = false;
+        {
+            std::lock_guard<std::mutex> lock(midiInputMapMutex);
+            std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.find(deviceIdStr);
+            if (it == midiInputMap.end() || it->second != midiInput) {
+                break;
+            }
+            unsigned short revents = 0;
+            if (snd_rawmidi_poll_descriptors_revents(midiInput, pfds, npfd, &revents) < 0 ||
+                (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                midiInputMap.erase(it);
+                snd_rawmidi_close(midiInput);
+                closedByError = true;
+            } else if ((revents & POLLIN) != 0) {
+                nread = snd_rawmidi_read(midiInput, buffer, sizeof(buffer));
+            }
+        }
+        if (closedByError) {
+            UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceDetached", deviceId);
+            break;
+        }
+        if (nread == -EAGAIN) {
+            continue;
+        }
+        if (nread < 0) {
+            closeRawmidiAndNotify(midiInputMap, midiInputMapMutex, deviceIdStr, "OnMidiInputDeviceDetached");
             break;
         }
 
-        if (read > 0) {
+        if (nread > 0) {
             // parse MIDI
-            for (int i = 0; i < read; i++) {
+            for (int i = 0; i < nread; i++) {
                 unsigned char midiEvent = buffer[i];
 
                 if (midiState == MIDI_STATE_WAIT) {
@@ -507,41 +885,94 @@ void midiEventWatcher(std::string deviceIdStr, snd_rawmidi_t* midiInput) {
                 }
             }
         }
-
-        std::this_thread::sleep_for(10ms);
     }
 }
 
 void midi2EventWatcher(std::string deviceIdStr, snd_ump_t* midiInput) {
     using namespace std::chrono_literals;
-    ssize_t read;
     uint32_t buffer[1024];
 
     while (!isStopped) {
+        bool tracked = false;
+        {
+            std::lock_guard<std::mutex> lock(midi2InputMapMutex);
+            std::map<std::string, snd_ump_t*>::iterator it = midi2InputMap.find(deviceIdStr);
+            tracked = it != midi2InputMap.end() && it->second == midiInput;
+        }
+        if (!tracked) {
+            break;
+        }
         if (!isMidi2Enabled) {
             std::this_thread::sleep_for(10ms);
             continue;
         }
 
-        read = snd_ump_read(midiInput, buffer, sizeof(buffer));
-        if (read < 0) {
-            // failed, stop this device
-            snd_ump_close(midiInput);
+        struct pollfd pfds[8];
+        int npfd = 0;
+        {
+            std::lock_guard<std::mutex> lock(midi2InputMapMutex);
+            std::map<std::string, snd_ump_t*>::iterator it = midi2InputMap.find(deviceIdStr);
+            if (it == midi2InputMap.end() || it->second != midiInput) {
+                break;
+            }
+            npfd = snd_ump_poll_descriptors_count(midiInput);
+            if (npfd > 8) {
+                npfd = 8;
+            }
+            if (npfd > 0) {
+                snd_ump_poll_descriptors(midiInput, pfds, npfd);
+            }
+        }
+        if (npfd <= 0) {
+            std::this_thread::sleep_for(10ms);
+            continue;
+        }
+
+        int pret = poll(pfds, npfd, kPollTimeoutMs);
+        if (pret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pret == 0) {
+            continue;
+        }
+
+        ssize_t nread = 0;
+        bool closedByError = false;
+        {
+            std::lock_guard<std::mutex> lock(midi2InputMapMutex);
+            std::map<std::string, snd_ump_t*>::iterator it = midi2InputMap.find(deviceIdStr);
+            if (it == midi2InputMap.end() || it->second != midiInput) {
+                break;
+            }
+            unsigned short revents = 0;
+            if (snd_ump_poll_descriptors_revents(midiInput, pfds, npfd, &revents) < 0 ||
+                (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                midi2InputMap.erase(it);
+                snd_ump_close(midiInput);
+                closedByError = true;
+            } else if ((revents & POLLIN) != 0) {
+                nread = snd_ump_read(midiInput, buffer, sizeof(buffer));
+            }
+        }
+        if (closedByError) {
+            UnitySendMessage(GAME_OBJECT_NAME, "OnMidi2InputDeviceDetached", deviceIdStr.c_str());
+            break;
+        }
+        if (nread == -EAGAIN) {
+            continue;
+        }
+        if (nread < 0) {
+            closeUmpAndNotify(midi2InputMap, midi2InputMapMutex, deviceIdStr, "OnMidi2InputDeviceDetached");
             break;
         }
 
-        if (read > 0) {
-            // parse UMP
-            std::ostringstream oss;
-            oss << deviceIdStr;
-            for (ssize_t i = 0; i < read; i++) {
-                oss << ",";
-                oss << buffer[i];
-            }
-            UnitySendMessage(GAME_OBJECT_NAME, "OnUmpMessage", oss.str().c_str());
+        if (nread > 0) {
+            ssize_t wordCount = nread / static_cast<ssize_t>(sizeof(uint32_t));
+            dispatchUmpWords(deviceIdStr.c_str(), buffer, static_cast<int>(wordCount));
         }
-
-        std::this_thread::sleep_for(10ms);
     }
 }
 
@@ -574,6 +1005,86 @@ static int check_permission(snd_seq_port_info_t *pinfo, int perm) {
     }
 
     return 0;
+}
+
+static int rawmidiSubdeviceCount(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int device, snd_rawmidi_stream_t stream) {
+    snd_rawmidi_info_set_device(info, device);
+    snd_rawmidi_info_set_stream(info, stream);
+    snd_rawmidi_info_set_subdevice(info, 0);
+    if (snd_ctl_rawmidi_info(ctl, info) < 0) {
+        return 0;
+    }
+    return static_cast<int>(snd_rawmidi_info_get_subdevices_count(info));
+}
+
+static std::string rawmidiSubdeviceName(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int device,
+                                       snd_rawmidi_stream_t stream, int sub, const char *fallbackName) {
+    snd_rawmidi_info_set_device(info, device);
+    snd_rawmidi_info_set_stream(info, stream);
+    snd_rawmidi_info_set_subdevice(info, sub);
+    if (snd_ctl_rawmidi_info(ctl, info) < 0) {
+        return fallbackName != nullptr ? fallbackName : "";
+    }
+
+    const char *subName = snd_rawmidi_info_get_subdevice_name(info);
+    if (subName != nullptr && subName[0] != '\0') {
+        return subName;
+    }
+
+    const char *devName = snd_rawmidi_info_get_name(info);
+    if (devName != nullptr && devName[0] != '\0') {
+        return devName;
+    }
+
+    return fallbackName != nullptr ? fallbackName : "";
+}
+
+static std::string hwCardDeviceKey(int card, int device) {
+    char key[32];
+    sprintf(key, "%d:%d", card, device);
+    return key;
+}
+
+static bool fillRawmidiInfo(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int device) {
+    snd_rawmidi_info_set_device(info, device);
+    snd_rawmidi_info_set_subdevice(info, 0);
+    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
+    if (snd_ctl_rawmidi_info(ctl, info) >= 0) {
+        return true;
+    }
+    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
+    return snd_ctl_rawmidi_info(ctl, info) >= 0;
+}
+
+static void recordUmpOccupiedDevices(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int card, int umpDevice,
+                                     std::set<std::string> *occupied) {
+    occupied->insert(hwCardDeviceKey(card, umpDevice));
+    if (!fillRawmidiInfo(ctl, info, umpDevice)) {
+        return;
+    }
+    int tied = snd_rawmidi_info_get_tied_device(info);
+    if (tied >= 0) {
+        occupied->insert(hwCardDeviceKey(card, tied));
+    }
+}
+
+static bool shouldSkipMidi1Rawmidi(snd_ctl_t *ctl, snd_rawmidi_info_t *info, int card, int device,
+                                  bool midi2Enabled, const std::set<std::string> &umpOccupied) {
+    if (!fillRawmidiInfo(ctl, info, device)) {
+        return false;
+    }
+#ifdef SND_RAWMIDI_INFO_UMP
+    if (snd_rawmidi_info_get_flags(info) & SND_RAWMIDI_INFO_UMP) {
+        return true;
+    }
+#endif
+    if (!midi2Enabled) {
+        return false;
+    }
+    if (umpOccupied.find(hwCardDeviceKey(card, device)) != umpOccupied.end()) {
+        return true;
+    }
+    return snd_rawmidi_info_get_tied_device(info) >= 0;
 }
 
 void midiConnectionWatcher() {
@@ -617,12 +1128,16 @@ void midiConnectionWatcher() {
     // current connections to detect detached
     std::set<std::string> currentConnections;
     std::set<std::string> connectionsToRemove;
+    std::set<std::string> umpOccupiedHw;
 
     while (!isStopped) {
         // virtual midi
         currentConnections.clear();
+        umpOccupiedHw.clear();
+        SeqClient *querySeq = selectQuerySeq();
+        if (querySeq != nullptr) {
         snd_seq_client_info_set_client(cinfo, -1);
-        while (snd_seq_query_next_client(seq_handle, cinfo) >= 0) {
+        while (seqQueryNextClient(*querySeq, cinfo) >= 0) {
             // loop with client
             if (snd_seq_client_info_get_type(cinfo) == SND_SEQ_KERNEL_CLIENT) {
                 // system client: ignore
@@ -633,7 +1148,7 @@ void midiConnectionWatcher() {
             snd_seq_port_info_set_client(pinfo, snd_seq_client_info_get_client(cinfo));
             snd_seq_port_info_set_port(pinfo, -1);
 
-            while (snd_seq_query_next_port(seq_handle, pinfo) >= 0) {
+            while (seqQueryNextPort(*querySeq, pinfo) >= 0) {
                 // loop with port
                 snd_seq_addr_t addr;
                 addr.client = snd_seq_client_info_get_client(cinfo);
@@ -641,7 +1156,7 @@ void midiConnectionWatcher() {
 
                 midi_version = snd_seq_client_info_get_midi_version(cinfo);
 
-                if (addr.client == selfClientId && addr.port == selfPortNumber) {
+                if (addr.client == seqMidi1.clientId || addr.client == seqMidi2.clientId) {
                     // self client: ignore
                     continue;
                 }
@@ -654,7 +1169,7 @@ void midiConnectionWatcher() {
                     if (midi_version == 0) {
                         if (isMidi1Enabled) {
                             std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
-                            if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end()) {
+                            if (virtualMidiInputMap.find(deviceId) == virtualMidiInputMap.end() && subscribeSeqInput(seqMidi1, addr)) {
                                 const char* deviceName = snd_seq_client_info_get_name(cinfo);
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
                                     deviceNames.insert(std::make_pair(deviceId, deviceName));
@@ -667,7 +1182,7 @@ void midiConnectionWatcher() {
                     } else if (midi_version == 1 || midi_version == 2) {
                         if (isMidi2Enabled) {
                             std::lock_guard<std::mutex> lock(virtualMidi2InputMapMutex);
-                            if (virtualMidi2InputMap.find(deviceId) == virtualMidi2InputMap.end()) {
+                            if (virtualMidi2InputMap.find(deviceId) == virtualMidi2InputMap.end() && subscribeSeqInput(seqMidi2, addr)) {
                                 const char* deviceName = snd_seq_client_info_get_name(cinfo);
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
                                     deviceNames.insert(std::make_pair(deviceId, deviceName));
@@ -727,7 +1242,11 @@ void midiConnectionWatcher() {
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                virtualMidiInputMap.erase(*it);
+                std::map<std::string, snd_seq_addr_t>::iterator found = virtualMidiInputMap.find(*it);
+                if (found != virtualMidiInputMap.end()) {
+                    unsubscribeSeqInput(seqMidi1, found->second);
+                    virtualMidiInputMap.erase(found);
+                }
             }
         }
         {
@@ -754,7 +1273,11 @@ void midiConnectionWatcher() {
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                virtualMidi2InputMap.erase(*it);
+                std::map<std::string, snd_seq_addr_t>::iterator found = virtualMidi2InputMap.find(*it);
+                if (found != virtualMidi2InputMap.end()) {
+                    unsubscribeSeqInput(seqMidi2, found->second);
+                    virtualMidi2InputMap.erase(found);
+                }
             }
         }
         {
@@ -769,6 +1292,7 @@ void midiConnectionWatcher() {
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
                 virtualMidi2OutputMap.erase(*it);
             }
+        }
         }
 
         currentConnections.clear();
@@ -791,6 +1315,7 @@ void midiConnectionWatcher() {
                     if (status < 0 || device < 0) {
                         break;
                     }
+                    recordUmpOccupiedDevices(ctl, info, card, device, &umpOccupiedHw);
                     snd_rawmidi_info_set_device(info, device);
 
                     // NOTE: this needs ALSA 1.2.13
@@ -798,9 +1323,7 @@ void midiConnectionWatcher() {
                     snd_ctl_ump_endpoint_info(ctl, umpinfo);
 
                     // sub devices: input
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_INPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hw2i:%d-%d-%d", card, device, sub);
@@ -809,10 +1332,11 @@ void midiConnectionWatcher() {
                         std::lock_guard<std::mutex> lock(midi2InputMapMutex);
                         if (midi2InputMap.find(deviceId) == midi2InputMap.end()) {
                             snd_ump_t* midiInput = NULL;
-                            snd_ump_open(&midiInput, NULL, sub_name, 0);
+                            snd_ump_open(&midiInput, NULL, sub_name, SND_RAWMIDI_NONBLOCK);
                             if (midiInput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_INPUT, sub, deviceName)));
                                 }
                                 midi2InputMap.insert(std::make_pair(deviceId, midiInput));
 
@@ -828,9 +1352,7 @@ void midiConnectionWatcher() {
 
                     snd_ctl_ump_endpoint_info(ctl, umpinfo);
                     // sub devices: output
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hw2o:%d-%d-%d", card, device, sub);
@@ -842,7 +1364,8 @@ void midiConnectionWatcher() {
                             int openResult = snd_ump_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_NONBLOCK); // never returns 
                             if (midiOutput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT, sub, deviceName)));
                                 }
                                 midi2OutputMap.insert(std::make_pair(deviceId, midiOutput));
 
@@ -873,12 +1396,13 @@ void midiConnectionWatcher() {
                     if (status < 0 || device < 0) {
                         break;
                     }
+                    if (shouldSkipMidi1Rawmidi(ctl, info, card, device, isMidi2Enabled, umpOccupiedHw)) {
+                        continue;
+                    }
                     snd_rawmidi_info_set_device(info, device);
 
                     // sub devices: input
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_INPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_INPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hwi:%d-%d-%d", card, device, sub);
@@ -887,10 +1411,12 @@ void midiConnectionWatcher() {
                         std::lock_guard<std::mutex> lock(midiInputMapMutex);
                         if (midiInputMap.find(deviceId) == midiInputMap.end()) {
                             snd_rawmidi_t* midiInput = NULL;
-                            snd_rawmidi_open(&midiInput, NULL, sub_name, 0);
+                            snd_rawmidi_open(&midiInput, NULL, sub_name, SND_RAWMIDI_NONBLOCK);
                             if (midiInput) {
+                                snd_rawmidi_read(midiInput, NULL, 0);
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_INPUT, sub, deviceName)));
                                 }
                                 midiInputMap.insert(std::make_pair(deviceId, midiInput));
 
@@ -905,9 +1431,7 @@ void midiConnectionWatcher() {
                     }
 
                     // sub devices: output
-                    snd_ctl_rawmidi_info(ctl, info);
-                    snd_rawmidi_info_set_stream(info, SND_RAWMIDI_STREAM_OUTPUT);
-                    subs = snd_rawmidi_info_get_subdevices_count(info);
+                    subs = rawmidiSubdeviceCount(ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT);
                     for (sub = 0; sub < subs; sub++) {
                         sprintf(sub_name, "hw:%d,%d,%d", card, device, sub);
                         sprintf(deviceId, "hwo:%d-%d-%d", card, device, sub);
@@ -916,11 +1440,11 @@ void midiConnectionWatcher() {
                         std::lock_guard<std::mutex> lock(midiOutputMapMutex);
                         if (midiOutputMap.find(deviceId) == midiOutputMap.end()) {
                             snd_rawmidi_t* midiOutput = NULL;
-                            // TODO FIXME: When MIDI1 and MIDI2 protocols coexist on one device, error -16 is returned.
                             snd_rawmidi_open(NULL, &midiOutput, sub_name, SND_RAWMIDI_NONBLOCK);
                             if (midiOutput) {
                                 if (deviceNames.find(deviceId) == deviceNames.end()) {
-                                    deviceNames.insert(std::make_pair(deviceId, deviceName));
+                                    deviceNames.insert(std::make_pair(deviceId, rawmidiSubdeviceName(
+                                        ctl, info, device, SND_RAWMIDI_STREAM_OUTPUT, sub, deviceName)));
                                 }
                                 midiOutputMap.insert(std::make_pair(deviceId, midiOutput));
 
@@ -937,93 +1461,67 @@ void midiConnectionWatcher() {
 
         {
             connectionsToRemove.clear();
-            std::lock_guard<std::mutex> lock(midiInputMapMutex);
-            for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.begin(); it != midiInputMap.end(); ++it) {
-                if (currentConnections.find(it->first) == currentConnections.end()) {
-                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiInputDeviceDetached", it->first.c_str());
-                    connectionsToRemove.insert(it->first);
+            {
+                std::lock_guard<std::mutex> lock(midiInputMapMutex);
+                for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiInputMap.begin(); it != midiInputMap.end(); ++it) {
+                    if (currentConnections.find(it->first) == currentConnections.end()) {
+                        connectionsToRemove.insert(it->first);
+                    }
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                midiInputMap.erase(*it);
+                closeRawmidiAndNotify(midiInputMap, midiInputMapMutex, *it, "OnMidiInputDeviceDetached");
             }
         }
         {
             connectionsToRemove.clear();
-            std::lock_guard<std::mutex> lock(midiOutputMapMutex);
-            for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiOutputMap.begin(); it != midiOutputMap.end(); ++it) {
-                if (currentConnections.find(it->first) == currentConnections.end()) {
-                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidiOutputDeviceDetached", it->first.c_str());
-                    connectionsToRemove.insert(it->first);
+            {
+                std::lock_guard<std::mutex> lock(midiOutputMapMutex);
+                for (std::map<std::string, snd_rawmidi_t*>::iterator it = midiOutputMap.begin(); it != midiOutputMap.end(); ++it) {
+                    if (currentConnections.find(it->first) == currentConnections.end()) {
+                        connectionsToRemove.insert(it->first);
+                    }
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                midiOutputMap.erase(*it);
+                closeRawmidiAndNotify(midiOutputMap, midiOutputMapMutex, *it, "OnMidiOutputDeviceDetached");
             }
         }
         {
             connectionsToRemove.clear();
-            std::lock_guard<std::mutex> lock(midi2InputMapMutex);
-            for (std::map<std::string, snd_ump_t*>::iterator it = midi2InputMap.begin(); it != midi2InputMap.end(); ++it) {
-                if (currentConnections.find(it->first) == currentConnections.end()) {
-                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidi2InputDeviceDetached", it->first.c_str());
-                    connectionsToRemove.insert(it->first);
+            {
+                std::lock_guard<std::mutex> lock(midi2InputMapMutex);
+                for (std::map<std::string, snd_ump_t*>::iterator it = midi2InputMap.begin(); it != midi2InputMap.end(); ++it) {
+                    if (currentConnections.find(it->first) == currentConnections.end()) {
+                        connectionsToRemove.insert(it->first);
+                    }
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                midi2InputMap.erase(*it);
+                closeUmpAndNotify(midi2InputMap, midi2InputMapMutex, *it, "OnMidi2InputDeviceDetached");
             }
         }
         {
             connectionsToRemove.clear();
-            std::lock_guard<std::mutex> lock(midi2OutputMapMutex);
-            for (std::map<std::string, snd_ump_t*>::iterator it = midi2OutputMap.begin(); it != midi2OutputMap.end(); ++it) {
-                if (currentConnections.find(it->first) == currentConnections.end()) {
-                    UnitySendMessage(GAME_OBJECT_NAME, "OnMidi2OutputDeviceDetached", it->first.c_str());
-                    connectionsToRemove.insert(it->first);
+            {
+                std::lock_guard<std::mutex> lock(midi2OutputMapMutex);
+                for (std::map<std::string, snd_ump_t*>::iterator it = midi2OutputMap.begin(); it != midi2OutputMap.end(); ++it) {
+                    if (currentConnections.find(it->first) == currentConnections.end()) {
+                        connectionsToRemove.insert(it->first);
+                    }
                 }
             }
             for (std::set<std::string>::iterator it = connectionsToRemove.begin(); it != connectionsToRemove.end(); ++it) {
-                midi2OutputMap.erase(*it);
+                closeUmpAndNotify(midi2OutputMap, midi2OutputMapMutex, *it, "OnMidi2OutputDeviceDetached");
             }
         }
 
         std::this_thread::sleep_for(100ms);
     }
 
-    // terminated, cleanup
-    {
-        std::lock_guard<std::mutex> lock(virtualMidiInputMapMutex);
-        virtualMidiInputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
-        virtualMidiOutputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(virtualMidi2InputMapMutex);
-        virtualMidi2InputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(virtualMidi2OutputMapMutex);
-        virtualMidi2OutputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(midiInputMapMutex);
-        midiInputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(midiOutputMapMutex);
-        midiOutputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(midi2InputMapMutex);
-        midi2InputMap.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(midi2OutputMapMutex);
-        midi2OutputMap.clear();
-    }
+    // terminated, leftover cleanup
+    shutdownMidi1Resources();
+    shutdownMidi2Resources();
     {
         std::lock_guard<std::mutex> lock(deviceNamesMutex);
         deviceNames.clear();
@@ -1034,64 +1532,44 @@ void SetSendMessageCallback(OnSendMessageDelegate callback) {
    onSendMessage = callback;
 }
 
-void InitializeMidiLinux() {
-    isMidi1Enabled = true;
-
-    if (seq_handle == nullptr) {
-        snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0);
-        snd_seq_set_client_name(seq_handle, "Midi Handler");
-        selfClientId = snd_seq_client_id(seq_handle);
-        selfPortNumber = snd_seq_create_simple_port(seq_handle, "inout",
-            SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ|SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE|SND_SEQ_PORT_CAP_UMP_ENDPOINT,
-            SND_SEQ_PORT_TYPE_APPLICATION);
-    }
-
+static void startWatcherThreadsIfNeeded() {
     if (isStopped) {
         isStopped = false;
         std::thread midiConnectionThread(midiConnectionWatcher);
         midiConnectionThread.detach();
-
-        // input watcher thread
         std::thread midiInputThread(virtualMidiEventWatcher);
         midiInputThread.detach();
         std::thread midi2InputThread(virtualMidi2EventWatcher);
         midi2InputThread.detach();
     }
+}
+
+void InitializeMidiLinux() {
+    isMidi1Enabled = true;
+    openSeqClient(seqMidi1, "Midi Handler", SND_SEQ_CLIENT_LEGACY_MIDI, SEQ_PORT_CAPS_MIDI1);
+    startWatcherThreadsIfNeeded();
 }
 
 void InitializeMidi2Linux() {
     isMidi2Enabled = true;
-
-    if (seq_handle == nullptr) {
-        snd_seq_open(&seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0);
-        snd_seq_set_client_name(seq_handle, "Midi Handler");
-        selfClientId = snd_seq_client_id(seq_handle);
-        selfPortNumber = snd_seq_create_simple_port(seq_handle, "inout",
-            SND_SEQ_PORT_CAP_READ|SND_SEQ_PORT_CAP_SUBS_READ|SND_SEQ_PORT_CAP_WRITE|SND_SEQ_PORT_CAP_SUBS_WRITE|SND_SEQ_PORT_CAP_UMP_ENDPOINT,
-            SND_SEQ_PORT_TYPE_APPLICATION);
-    }
-
-    if (isStopped) {
-        isStopped = false;
-        std::thread midiConnectionThread(midiConnectionWatcher);
-        midiConnectionThread.detach();
-    
-        // input watcher thread
-        std::thread midiInputThread(virtualMidiEventWatcher);
-        midiInputThread.detach();
-        std::thread midi2InputThread(virtualMidi2EventWatcher);
-        midi2InputThread.detach();
-    }
+    openSeqClient(seqMidi2, "Midi2 Handler", SND_SEQ_CLIENT_UMP_MIDI_2_0, SEQ_PORT_CAPS_MIDI2);
+    startWatcherThreadsIfNeeded();
 }
 
 void TerminateMidiLinux() {
-    isStopped = true;
     isMidi1Enabled = false;
+    shutdownMidi1Resources();
+    if (!isMidi2Enabled) {
+        isStopped = true;
+    }
 }
 
 void TerminateMidi2Linux() {
-    isStopped = true;
     isMidi2Enabled = false;
+    shutdownMidi2Resources();
+    if (!isMidi1Enabled) {
+        isStopped = true;
+    }
 }
 
 const char* GetDeviceNameLinux(const char* deviceId) {
@@ -1116,16 +1594,12 @@ void SendMidiNoteOff(const char* deviceId, char channel, char note, char velocit
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_noteoff(&ev, channel, note, velocity);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1144,16 +1618,12 @@ void SendMidiNoteOn(const char* deviceId, char channel, char note, char velocity
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_noteon(&ev, channel, note, velocity);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1172,16 +1642,12 @@ void SendMidiPolyphonicAftertouch(const char* deviceId, char channel, char note,
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_keypress(&ev, channel, note, pressure);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1200,16 +1666,12 @@ void SendMidiControlChange(const char* deviceId, char channel, char func, char v
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_controller(&ev, channel, func, value);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1228,16 +1690,12 @@ void SendMidiProgramChange(const char* deviceId, char channel, char program) {
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_pgmchange(&ev, channel, program);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1256,16 +1714,12 @@ void SendMidiChannelAftertouch(const char* deviceId, char channel, char pressure
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_chanpress(&ev, channel, pressure);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1284,16 +1738,12 @@ void SendMidiPitchWheel(const char* deviceId, char channel, short amount) {
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_pitchbend(&ev, channel, amount - 8192);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1311,16 +1761,12 @@ void SendMidiSystemExclusive(const char* deviceId, unsigned char* data, int leng
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
+        if (it2 != virtualMidiOutputMap.end()) {
             snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
+            initSeqEventDirect(&ev, seqMidi1.portNumber, it2->second);
 
             snd_seq_ev_set_sysex(&ev, length, data);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+            outputSeqEvent(seqMidi1, &ev);
         }
     }
 }
@@ -1389,16 +1835,8 @@ void SendMidiStart(const char* deviceId) {
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            snd_seq_ev_set_queue_start(&ev, SND_SEQ_QUEUE_DIRECT);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+        if (it2 != virtualMidiOutputMap.end()) {
+            sendSeqRealtimeEvent(it2->second, SND_SEQ_EVENT_START);
         }
     }
 }
@@ -1417,16 +1855,8 @@ void SendMidiContinue(const char* deviceId) {
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            snd_seq_ev_set_queue_continue(&ev, SND_SEQ_QUEUE_DIRECT);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+        if (it2 != virtualMidiOutputMap.end()) {
+            sendSeqRealtimeEvent(it2->second, SND_SEQ_EVENT_CONTINUE);
         }
     }
 }
@@ -1445,16 +1875,8 @@ void SendMidiStop(const char* deviceId) {
     {
         std::lock_guard<std::mutex> lock(virtualMidiOutputMapMutex);
         decltype(virtualMidiOutputMap)::iterator it2 = virtualMidiOutputMap.find(deviceId);
-        if (it2 != virtualMidiOutputMap.end() && seq_handle != nullptr) {
-            snd_seq_event_t ev;
-            snd_seq_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            snd_seq_ev_set_queue_stop(&ev, SND_SEQ_QUEUE_DIRECT);
-            snd_seq_event_output(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+        if (it2 != virtualMidiOutputMap.end()) {
+            sendSeqRealtimeEvent(it2->second, SND_SEQ_EVENT_STOP);
         }
     }
 }
@@ -1480,29 +1902,40 @@ void SendMidiReset(const char* deviceId) {
 }
 
 void SendUmpMessage(const char* deviceId, uint32_t* ump, int length) {
+    if (ump == nullptr || length <= 0) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(midi2OutputMapMutex);
         decltype(midi2OutputMap)::iterator it = midi2OutputMap.find(deviceId);
         if (it != midi2OutputMap.end()) {
-            snd_ump_write(it->second, ump, length*sizeof(uint32_t));
+            snd_ump_write(it->second, ump, static_cast<size_t>(length) * sizeof(uint32_t));
         }
     }
 
     {
         std::lock_guard<std::mutex> lock(virtualMidi2OutputMapMutex);
         decltype(virtualMidi2OutputMap)::iterator it2 = virtualMidi2OutputMap.find(deviceId);
-        if (it2 != virtualMidi2OutputMap.end() && seq_handle != nullptr) {
-            snd_seq_ump_event_t ev;
-            snd_seq_ump_ev_clear(&ev);
-            snd_seq_ev_set_direct(&ev);
-            snd_seq_ev_set_ump(&ev);
+        if (it2 != virtualMidi2OutputMap.end()) {
+            int offset = 0;
+            while (offset < length) {
+                int packetWords = umpPacketWordCount(ump[offset]);
+                if (offset + packetWords > length) {
+                    packetWords = length - offset;
+                }
+                if (packetWords > 4) {
+                    packetWords = 4;
+                }
 
-            snd_seq_ev_set_dest(&ev, it2->second.client, it2->second.port);
-
-            // https://github.com/alsa-project/alsa-lib/blob/master/include/seqmid.h#L322-L329
-            snd_seq_ev_set_ump_data(&ev, ump, length);
-            snd_seq_ump_event_output_direct(seq_handle, &ev);
-            snd_seq_drain_output(seq_handle);
+                snd_seq_ump_event_t ev;
+                initSeqUmpEventDirect(&ev, seqMidi2.portNumber, it2->second);
+                snd_seq_ev_set_ump(&ev);
+                // snd_seq_ev_set_ump_data takes a byte count, max 16
+                snd_seq_ev_set_ump_data(&ev, ump + offset, static_cast<size_t>(packetWords) * sizeof(uint32_t));
+                outputSeqUmpEvent(seqMidi2, &ev);
+                offset += packetWords;
+            }
         }
     }
 }
